@@ -11,3 +11,11 @@ services:
         sync: false
       - key: LINE_CHANNEL_ACCESS_TOKEN
         sync: false
+      - key: GROUP_REGISTRY_URL
+        sync: false
+      - key: GROUP_REGISTRY_API_KEY
+        sync: false
+      - key: OWNER_USER_ID
+        value: U6c6441cb38102499d1f80d4ea79a53ab
+      - key: INTERNAL_USER_IDS
+        value: U6c6441cb38102499d1f80d4ea79a53ab,Ub983deb79584603885e5b28e9fdf2d5d,U9478b00702c716685d9d8b021d62d538
