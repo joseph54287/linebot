@@ -5,11 +5,13 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import logging
 import os
 import re
 import time
 from datetime import datetime, timedelta
 from typing import Any
+from urllib.parse import parse_qs
 from zoneinfo import ZoneInfo
 
 import requests
@@ -24,6 +26,11 @@ EXPENSE_API_URL = os.environ.get("EXPENSE_API_URL", GROUP_REGISTRY_URL).rstrip("
 EXPENSE_API_KEY = os.environ.get("EXPENSE_API_KEY", GROUP_REGISTRY_API_KEY)
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 RECEIPT_VISION_MODEL = os.environ.get("RECEIPT_VISION_MODEL", "gemini-3.6-flash")
+QUOTE_WEBHOOK_URL = os.environ.get(
+    "QUOTE_WEBHOOK_URL",
+    "https://linebot-bam2.onrender.com/webhook",
+).rstrip("/")
+QUOTE_OWNER_USER_ID = "Ub983deb79584603885e5b28e9fdf2d5d"
 OWNER_USER_ID = os.environ.get(
     "OWNER_USER_ID",
     "U6c6441cb38102499d1f80d4ea79a53ab",
@@ -43,6 +50,7 @@ INTERNAL_USER_IDS = {
 }
 
 app = FastAPI(title="AURTOR LINE Bot")
+logger = logging.getLogger(__name__)
 
 # Render 只暫存尚未送出的對話；完成、取消或逾時後立即清除。
 EXPENSE_SESSIONS: dict[str, dict[str, Any]] = {}
@@ -91,6 +99,54 @@ FIELD_LABELS = {
     "item": ["項目", "品項", "內容"],
     "amount": ["金額", "費用"],
 }
+
+
+def is_quote_event(event: dict[str, Any]) -> bool:
+    """只辨識高爾賢個人聊天室內明確定義的報價操作。"""
+    source = event.get("source", {})
+    if (
+        source.get("type") != "user"
+        or source.get("userId") != QUOTE_OWNER_USER_ID
+    ):
+        return False
+
+    if event.get("type") == "postback":
+        data = event.get("postback", {}).get("data", "")
+        fields = {key: values[-1] for key, values in parse_qs(data).items()}
+        return (
+            fields.get("action") == "scheme"
+            and bool(fields.get("invitation"))
+            and fields.get("scheme") in {"A", "B", "C"}
+        )
+
+    if event.get("type") == "message":
+        message = event.get("message", {})
+        if message.get("type") != "text":
+            return False
+        text = message.get("text", "").strip()
+        return text in {"確認", "送出"} or text.startswith("主旨：")
+
+    return False
+
+
+def forward_quote_webhook(body: bytes, signature: str) -> bool:
+    """原樣轉送 LINE request；失敗不重試，避免重複寄出報價信。"""
+    try:
+        response = requests.post(
+            QUOTE_WEBHOOK_URL,
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Line-Signature": signature,
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
+        return True
+    except requests.RequestException as error:
+        # 不記錄原始內容、簽章或文案，避免敏感資料進入 Render log。
+        logger.error("報價 Webhook 轉送失敗：%s", type(error).__name__)
+        return False
 
 
 def verify_signature(body: bytes, signature: str) -> bool:
@@ -655,7 +711,14 @@ async def webhook(request: Request):
 
     payload = await request.json()
 
+    # LINE 簽章綁定原始 bytes，因此整批原樣轉送；報價後端會忽略非報價事件。
+    if any(is_quote_event(event) for event in payload.get("events", [])):
+        forward_quote_webhook(body, signature)
+
     for event in payload.get("events", []):
+        # 報價事件已交由專用後端處理，避免兩邊重複使用 Reply Token。
+        if is_quote_event(event):
+            continue
         source = event.get("source", {})
         user_id = source.get("userId", "")
         reply_token = event.get("replyToken", "")
@@ -932,6 +995,7 @@ async def health():
         ),
         "expense_configured": bool(EXPENSE_API_URL and EXPENSE_API_KEY),
         "receipt_vision_configured": bool(GEMINI_API_KEY),
+        "quote_webhook_configured": bool(QUOTE_WEBHOOK_URL),
         "internal_user_count": len(INTERNAL_USER_IDS),
         "owner_configured": bool(OWNER_USER_ID),
     }
