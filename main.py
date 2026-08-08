@@ -120,6 +120,8 @@ ITEM_KEYWORDS = {
     "後期": ["後期", "剪輯", "調光", "混音", "動畫", "字幕", "特效"],
 }
 PROJECT_EXPENSE_CATEGORY = "案件支出（餐飲、道具、人員...）"
+COMPANY_TAX_ID = "90531465"
+COMPANY_TAX_ID_MISSING = "公司統編不符合"
 
 FIELD_LABELS = {
     "project": ["專案", "案件"],
@@ -239,8 +241,12 @@ def option_card(title: str, options: list[str], field: str) -> dict[str, Any]:
     }
 
 
-def project_candidate_card(projects: list[dict[str, Any]]) -> dict[str, Any]:
-    """建立近期未結案專案圖卡；postback 只保存索引，避免長名稱超限。"""
+def project_candidate_card(projects: list[dict[str, Any]], page: int = 0) -> dict[str, Any]:
+    """分頁顯示未結案專案；第一頁優先提供七筆，避免選項過長。"""
+    page = max(0, page)
+    page_size = 7 if page == 0 else 6
+    start = 0 if page == 0 else 7 + (page - 1) * 6
+    page_projects = projects[start:start + page_size]
     buttons = [
         {
             "type": "button",
@@ -250,12 +256,20 @@ def project_candidate_card(projects: list[dict[str, Any]]) -> dict[str, Any]:
             "action": {
                 "type": "postback",
                 "label": str(project["name"])[:20],
-                "data": f"expense:project:{index}",
+                "data": f"expense:project:{start + index}",
                 "displayText": str(project["name"]),
             },
         }
-        for index, project in enumerate(projects[:7])
+        for index, project in enumerate(page_projects)
     ]
+    if page > 0:
+        buttons.append({"type": "button", "height": "sm", "margin": "sm", "action": {
+            "type": "postback", "label": "上一頁", "data": f"expense:project_page:{page - 1}", "displayText": "上一頁專案",
+        }})
+    if start + page_size < len(projects):
+        buttons.append({"type": "button", "height": "sm", "margin": "sm", "action": {
+            "type": "postback", "label": "下一頁", "data": f"expense:project_page:{page + 1}", "displayText": "下一頁專案",
+        }})
     buttons.extend([{
         "type": "button",
         "style": "primary",
@@ -263,9 +277,9 @@ def project_candidate_card(projects: list[dict[str, Any]]) -> dict[str, Any]:
         "margin": "sm",
         "action": {
             "type": "postback",
-            "label": "填寫專案名稱",
-            "data": "expense:project:manual",
-            "displayText": "填寫專案名稱",
+            "label": "搜尋／填寫專案",
+            "data": "expense:project:search",
+            "displayText": "搜尋或填寫專案",
         },
     }, {
         "type": "button",
@@ -290,6 +304,19 @@ def project_candidate_card(projects: list[dict[str, Any]]) -> dict[str, Any]:
                 "contents": [{"type": "text", "text": "還差專案名稱", "color": "#FFFFFF", "weight": "bold"}],
             },
             "body": {"type": "box", "layout": "vertical", "contents": buttons},
+        },
+    }
+
+
+def company_tax_invalid_card() -> dict[str, Any]:
+    """買方統編不正確時阻擋送出，且不在 LINE 顯示任何辨識到的號碼。"""
+    return {
+        "type": "template", "altText": "公司統編未通過驗證", "template": {
+            "type": "buttons", "title": "無法確認公司代墊", "text": "單據上未辨識到正確的公司統編，請重新拍攝完整單據。",
+            "actions": [
+                {"type": "postback", "label": "重新拍攝", "data": "expense:retake", "displayText": "重新拍攝收據"},
+                {"type": "postback", "label": "取消登記", "data": "expense:cancel", "displayText": "取消登記"},
+            ],
         },
     }
 
@@ -539,7 +566,10 @@ def missing_expense_fields(data: dict[str, Any]) -> list[str]:
         "category": "項目分類或更清楚的消費內容",
         "payer": "支出人",
     }
-    return [label for field, label in required.items() if data.get(field) in {None, ""}]
+    missing = [label for field, label in required.items() if data.get(field) in {None, ""}]
+    if data.get("receiptBase64") and data.get("companyTaxIdValid") is not True:
+        missing.append(COMPANY_TAX_ID_MISSING)
+    return missing
 
 
 def build_missing_prompt(missing: list[str]) -> dict[str, Any]:
@@ -585,9 +615,7 @@ def filter_recent_open_projects(
     context: str = "",
     now: datetime | None = None,
 ) -> list[dict[str, Any]]:
-    """篩選最近 90 天未結案專案，並依內容相關性與更新時間排序。"""
-    current = (now or datetime.now(TAIPEI_TZ)).replace(tzinfo=None)
-    cutoff = current - timedelta(days=90)
+    """保留全部未結案專案，依內容相關性與更新時間排序。"""
     keywords = {token.casefold() for token in re.findall(r"[A-Za-z0-9\u4e00-\u9fff]+", context) if len(token) >= 2}
     candidates: list[tuple[int, datetime, dict[str, Any]]] = []
     for raw_project in projects:
@@ -600,8 +628,6 @@ def filter_recent_open_projects(
         if status in CLOSED_PROJECT_STATUSES:
             continue
         updated_at = _project_updated_at(raw_project)
-        if updated_at and updated_at < cutoff:
-            continue
         aliases = raw_project.get("aliases") if isinstance(raw_project.get("aliases"), list) else []
         searchable = " ".join([name, *map(str, aliases)]).casefold()
         relevance = sum(1 for keyword in keywords if keyword in searchable)
@@ -613,7 +639,7 @@ def filter_recent_open_projects(
             "aliases": aliases,
         }))
     candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    return [project for _, _, project in candidates[:10]]
+    return [project for _, _, project in candidates]
 
 
 def get_recent_open_projects(context: str = "") -> list[dict[str, Any]]:
@@ -639,6 +665,8 @@ def get_recent_open_projects(context: str = "") -> list[dict[str, Any]]:
 
 def build_project_or_missing_prompt(session: dict[str, Any], missing: list[str]) -> dict[str, Any]:
     """依缺漏欄位顯示可直接完成或取消的操作圖卡。"""
+    if COMPANY_TAX_ID_MISSING in missing:
+        return company_tax_invalid_card()
     project_label = "專案名稱（沒有專案請寫「專案無」）"
     if project_label in missing:
         context = " ".join([
@@ -650,9 +678,9 @@ def build_project_or_missing_prompt(session: dict[str, Any], missing: list[str])
             projects = get_recent_open_projects(context)
         except (requests.RequestException, ValueError, TypeError):
             projects = []
-        session["project_candidates"] = projects[:7]
-        LOGGER.info("expense project candidates count=%s", len(projects[:7]))
-        return project_candidate_card(projects[:7])
+        session["project_candidates"] = projects
+        LOGGER.info("expense project candidates count=%s", len(projects))
+        return project_candidate_card(projects)
     if "消費項目" in missing or "項目分類或更清楚的消費內容" in missing:
         return item_option_card()
     if "金額" in missing:
@@ -688,18 +716,18 @@ def next_prompt(session: dict[str, Any]) -> dict[str, Any]:
 
 def build_expense_confirmation(data: dict[str, Any]) -> dict[str, Any]:
     """建立送出前的資料確認圖卡。"""
+    if data.get("receiptBase64") and data.get("companyTaxIdValid") is not True:
+        return company_tax_invalid_card()
     summary = "\n".join([
         f"日期：{data.get('date', '')}",
         f"專案：{data.get('project', '')}",
         f"項目：{data.get('item', '')}",
         f"金額：${data.get('amount', '')}",
-        f"分類：{data.get('category', '')}",
         f"支出人：{data.get('payer', '')}",
         f"付款：{data.get('payment', '')}",
         f"已領款：{data.get('reimbursed', '')}",
-        f"統編發票：{data.get('invoice', '')}",
+        f"公司統編：{'正確' if data.get('companyTaxIdValid') else '未驗證'}",
         f"收據：{'已附照片' if data.get('receiptBase64') else '未附'}",
-        f"備註：{data.get('note', '')}",
     ])
     return {
         "type": "flex",
@@ -716,6 +744,24 @@ def build_expense_confirmation(data: dict[str, Any]) -> dict[str, Any]:
             ]},
         },
     }
+
+
+def expense_result_card(data: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
+    """寫入成功後提供可追蹤結果；重複單據則明確阻擋新增。"""
+    duplicate = bool(result.get("duplicate"))
+    record_url = str(result.get("recordUrl") or "").strip()
+    title = "這張單據已登記過" if duplicate else "代墊登記完成"
+    text = "已找到相同單據，本次沒有重複新增。" if duplicate else "\n".join([
+        f"專案：{data.get('project', '')}", f"項目：{data.get('item', '')}",
+        f"金額：${data.get('amount', '')}", "收據：已儲存",
+    ])
+    actions: list[dict[str, Any]] = []
+    if record_url.startswith("https://"):
+        actions.append({"type": "uri", "label": "查看登記資料" if not duplicate else "查看前次紀錄", "uri": record_url})
+    if not duplicate:
+        actions.append({"type": "postback", "label": "登記下一筆", "data": "expense:new", "displayText": "登記下一筆代墊"})
+    actions.append({"type": "postback", "label": "完成" if not duplicate else "取消", "data": "expense:cancel", "displayText": "完成"})
+    return {"type": "template", "altText": title, "template": {"type": "buttons", "title": title, "text": text[:160], "actions": actions}}
 
 
 def get_line_profile_name(user_id: str) -> str:
@@ -754,8 +800,9 @@ def analyze_receipt_image(image_base64: str, mime_type: str, focused_retry: bool
     prompt = """你是台灣公司支出單據 OCR 欄位擷取器。只輸出 JSON，不要 Markdown。
 不要因為照片角度、皺摺、手寫、裁切或版型陌生就拒絕，請先盡力擷取可見欄位。輸出：
 documentType, merchantName, date(YYYY-MM-DD或空字串), items(字串陣列),
-totalAmount(數字或null), invoiceNumber, taxId, hasBusinessTaxId(布林值),
+totalAmount(數字或null), invoiceNumber, buyerTaxId, sellerTaxId,
 currency(預設TWD), confidence(0到1), warnings(字串陣列), isReceipt(布林值), imageType(簡短字串)。
+buyerTaxId 只能填寫買受人／買方／客戶的統一編號；sellerTaxId 只能填寫商家／賣方的統一編號，兩者不可混用。
 totalAmount 必須是整張單據的應付或實付總額，不可使用統編、發票號碼、日期或交易序號。
 看不清楚就留空並在 warnings 說明，不要猜測。"""
     if focused_retry:
@@ -810,13 +857,12 @@ def receipt_signal_count(analysis: dict[str, Any]) -> int:
 def merge_receipt_analyses(primary: dict[str, Any], retry: dict[str, Any]) -> dict[str, Any]:
     """以第一輪為主，使用第二輪補足空白欄位及更可信的總額。"""
     merged = dict(primary)
-    for field in ["documentType", "merchantName", "date", "items", "totalAmount", "invoiceNumber", "taxId", "currency", "imageType"]:
+    for field in ["documentType", "merchantName", "date", "items", "totalAmount", "invoiceNumber", "buyerTaxId", "sellerTaxId", "currency", "imageType"]:
         current_value = merged.get(field)
         if current_value is None or current_value == "" or (field == "items" and not current_value):
             merged[field] = retry.get(field)
     if valid_receipt_amount(primary) is None and valid_receipt_amount(retry) is not None:
         merged["totalAmount"] = retry["totalAmount"]
-    merged["hasBusinessTaxId"] = bool(primary.get("hasBusinessTaxId") or retry.get("hasBusinessTaxId"))
     merged["isReceipt"] = bool(primary.get("isReceipt") or retry.get("isReceipt"))
     merged["confidence"] = max(float(primary.get("confidence") or 0), float(retry.get("confidence") or 0))
     warnings = []
@@ -828,6 +874,16 @@ def merge_receipt_analyses(primary: dict[str, Any], retry: dict[str, Any]) -> di
     merged["warnings"] = warnings
     merged["usedSecondPass"] = True
     return merged
+
+
+def normalize_tax_id(value: Any) -> str:
+    """統編只保留數字，以便處理空格或連字號，但不接受部分相符。"""
+    return re.sub(r"\D", "", str(value or ""))
+
+
+def has_valid_company_tax_id(analysis: dict[str, Any]) -> bool:
+    """只檢查 Gemini 明確標成買方的統編，禁止拿賣方統編誤判通過。"""
+    return normalize_tax_id(analysis.get("buyerTaxId")) == COMPANY_TAX_ID
 
 
 def receipt_analysis_to_expense(
@@ -859,14 +915,13 @@ def receipt_analysis_to_expense(
     item = infer_item_option(" ".join([merchant, item_detail]))
     category = infer_category(" ".join([merchant, item_detail])) or (PROJECT_EXPENSE_CATEGORY if item else "")
     invoice_number = str(analysis.get("invoiceNumber") or "").strip()
-    tax_id = str(analysis.get("taxId") or "").strip()
+    company_tax_id_valid = has_valid_company_tax_id(analysis)
     warnings = analysis.get("warnings") if isinstance(analysis.get("warnings"), list) else []
     confidence = float(analysis.get("confidence") or 0)
     note_parts = [part for part in [
         f"商家：{merchant}" if merchant else "",
         f"單據內容：{item_detail}" if item_detail and item_detail != merchant else "",
         f"發票號碼：{invoice_number}" if invoice_number else "",
-        f"統編：{tax_id}" if tax_id else "",
     ] if part]
     if confidence < 0.75:
         note_parts.append("影像辨識信心較低，已要求人工確認")
@@ -884,7 +939,10 @@ def receipt_analysis_to_expense(
         "payer": INTERNAL_USER_NAMES.get(user_id, ""),
         "payment": "已支出",
         "reimbursed": "否",
-        "invoice": "是" if analysis.get("hasBusinessTaxId") else "未開",
+        "invoice": "是" if company_tax_id_valid else "否",
+        "companyTaxIdValid": company_tax_id_valid,
+        "companyTaxId": COMPANY_TAX_ID if company_tax_id_valid else "",
+        "invoiceNumber": invoice_number,
         "note": "；".join(note_parts) or "影像收據自動辨識",
         "receiptBase64": image_base64,
         "receiptMimeType": mime_type,
@@ -922,6 +980,8 @@ def process_receipt_image(user_id: str, image_base64: str, mime_type: str) -> tu
 
 def submit_expense(data: dict[str, Any]) -> dict[str, Any]:
     """交由 Google Apps Script 上傳收據並新增支出資料。"""
+    if data.get("receiptBase64") and data.get("companyTaxIdValid") is not True:
+        raise requests.RequestException("company tax id is not valid")
     if not EXPENSE_API_URL or not EXPENSE_API_KEY:
         raise requests.RequestException("expense api is not configured")
     # 同一暫存重試時沿用交易識別碼，讓 Apps Script 避免建立重複附件或資料列。
@@ -1062,16 +1122,27 @@ async def webhook(request: Request):
                 EXPENSE_SESSIONS.pop(user_id, None)
                 reply_text(reply_token, "本次代墊登記已取消。")
                 continue
+            if raw_data == "expense:new":
+                EXPENSE_SESSIONS[user_id] = {"step": "receipt_waiting_image", "updated_at": time.time(), "data": {"registrantUserId": user_id}}
+                reply_text(reply_token, "請上傳下一張完整、清楚且避免反光的收據或發票照片。")
+                continue
             if not session:
                 reply_text(reply_token, "登記已逾時，請重新輸入「代墊」。")
                 continue
             parts = raw_data.split(":", 2)
             action = parts[1]
             value = parts[2] if len(parts) > 2 else ""
+            if action == "project_page":
+                try:
+                    page = int(value)
+                except ValueError:
+                    page = 0
+                reply_messages(reply_token, [project_candidate_card(session.get("project_candidates", []), page)])
+                continue
             if action == "project":
-                if value == "manual":
-                    session["step"] = "project_manual"
-                    reply_text(reply_token, "請直接輸入專案名稱；沒有專案請輸入「專案無」。")
+                if value in {"manual", "search"}:
+                    session["step"] = "project_search"
+                    reply_text(reply_token, "請輸入專案關鍵字或完整專案名稱；沒有專案請輸入「專案無」。")
                     continue
                 if value == "none":
                     session["data"]["project"] = "專案無"
@@ -1122,13 +1193,13 @@ async def webhook(request: Request):
                 session["submitting"] = True
                 try:
                     session["data"]["registrantName"] = get_line_profile_name(user_id)
-                    submit_expense(session["data"])
+                    result = submit_expense(session["data"])
                 except requests.RequestException:
                     session["submitting"] = False
                     reply_text(reply_token, "目前無法寫入支出資料，內容已保留，請稍後再按一次「確認送出」。")
                     continue
                 EXPENSE_SESSIONS.pop(user_id, None)
-                reply_text(reply_token, "代墊登記完成，資料已寫入公司支出簿。")
+                reply_messages(reply_token, [expense_result_card(session["data"], result)])
                 continue
             elif action == "modify":
                 session["step"] = "quick_edit"
@@ -1314,9 +1385,16 @@ async def webhook(request: Request):
 
         if session:
             step = session["step"]
-            if step in {"project", "project_manual"}:
+            if step in {"project", "project_manual", "project_search"}:
+                if step == "project_search" and text not in {"無", "沒有", "無專案", "專案無"}:
+                    candidates = session.get("project_candidates", [])
+                    matched = [project for project in candidates if text.casefold() in str(project.get("name", "")).casefold()]
+                    if matched:
+                        session["project_candidates"] = matched
+                        reply_messages(reply_token, [project_candidate_card(matched)])
+                        continue
                 session["data"]["project"] = "專案無" if text in {"無", "沒有", "無專案", "專案無"} else text
-                if step == "project_manual":
+                if step in {"project_manual", "project_search"}:
                     missing = missing_expense_fields(session["data"])
                     session["step"] = "quick_missing" if missing else "quick_confirm"
                     reply_messages(reply_token, [build_project_or_missing_prompt(session, missing) if missing else build_expense_confirmation(session["data"])])

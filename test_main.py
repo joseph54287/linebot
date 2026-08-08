@@ -110,6 +110,7 @@ def test_confirmation_switches_receipt_label():
         "invoice": "未開",
         "note": "測試",
         "receiptBase64": "abc",
+        "companyTaxIdValid": True,
     }
     card = main.build_expense_confirmation(data)
     summary = card["contents"]["body"]["contents"][0]["text"]
@@ -180,8 +181,8 @@ def test_receipt_analysis_creates_one_expense_row():
         "items": ["便當", "飲料"],
         "totalAmount": 350,
         "invoiceNumber": "AB12345678",
-        "taxId": "12345678",
-        "hasBusinessTaxId": True,
+        "buyerTaxId": "9053-1465",
+        "sellerTaxId": "12345678",
         "confidence": 0.96,
         "warnings": [],
     }
@@ -196,6 +197,8 @@ def test_receipt_analysis_creates_one_expense_row():
     assert data["amount"] == 350
     assert data["category"] == "案件支出（餐飲、道具、人員...）"
     assert data["invoice"] == "是"
+    assert data["companyTaxIdValid"] is True
+    assert "統編" not in data["note"]
     assert missing == ["專案名稱（沒有專案請寫「專案無」）"]
 
 
@@ -258,7 +261,7 @@ def test_receipt_false_flag_is_accepted_when_fields_are_valid():
 def test_process_receipt_uses_second_pass_to_find_total(monkeypatch):
     results = iter([
         {"isReceipt": True, "merchantName": "測試店", "items": ["餐費"], "totalAmount": None},
-        {"isReceipt": True, "date": "2026-08-08", "totalAmount": 880, "confidence": 0.9},
+        {"isReceipt": True, "date": "2026-08-08", "totalAmount": 880, "buyerTaxId": "90531465", "confidence": 0.9},
     ])
 
     def fake_analyze(image_base64, mime_type, focused_retry=False):
@@ -272,7 +275,7 @@ def test_process_receipt_uses_second_pass_to_find_total(monkeypatch):
     assert data["receiptSecondPass"] is True
 
 
-def test_recent_projects_filter_rank_and_limit():
+def test_open_projects_filter_rank_without_age_or_limit():
     projects = [
         {"id": "old", "name": "舊專案", "status": "進行中", "updatedAt": "2026-01-01"},
         {"id": "closed", "name": "PJR 已結案", "status": "已結案", "updatedAt": "2026-08-01"},
@@ -283,16 +286,17 @@ def test_recent_projects_filter_rank_and_limit():
         ],
     ]
     result = main.filter_recent_open_projects(projects, "PJR 吊車", main.datetime(2026, 8, 8))
-    assert len(result) == 10
+    assert len(result) == 14
     assert result[0]["id"] == "pjr"
-    assert all(project["id"] not in {"old", "closed"} for project in result)
+    assert all(project["id"] != "closed" for project in result)
+    assert any(project["id"] == "old" for project in result)
 
 
 def test_project_card_uses_short_index_postbacks():
     card = main.project_candidate_card([{"id": "p1", "name": "很長的專案名稱測試"}])
     buttons = card["contents"]["body"]["contents"]
     assert buttons[0]["action"]["data"] == "expense:project:0"
-    assert buttons[-3]["action"]["data"] == "expense:project:manual"
+    assert buttons[-3]["action"]["data"] == "expense:project:search"
     assert buttons[-2]["action"]["data"] == "expense:project:none"
     assert buttons[-1]["action"]["data"] == "expense:cancel"
 
@@ -317,6 +321,7 @@ def test_expense_supplements_accumulate_without_losing_receipt():
         "invoice": "未開",
         "receiptBase64": "receipt-image",
         "receiptMimeType": "image/jpeg",
+        "companyTaxIdValid": True,
     }
     after_project = main.merge_expense_text(existing, "這個專案是 MG50", "U-test")
     completed = main.merge_expense_text(after_project, "加油 $500", "U-test")
@@ -336,6 +341,7 @@ def test_cpc_receipt_is_classified_as_transportation():
         "date": "2026-07-06",
         "items": ["九五無鉛汽油"],
         "totalAmount": 500,
+        "buyerTaxId": "90531465",
         "confidence": 0.95,
     }
     data, missing = main.receipt_analysis_to_expense(
@@ -356,7 +362,7 @@ def test_unknown_item_and_no_answer_show_action_cards(monkeypatch):
     monkeypatch.setattr(main, "get_recent_open_projects", lambda context: [])
     project_message = main.build_project_or_missing_prompt(session, ["專案名稱（沒有專案請寫「專案無」）"])
     project_buttons = project_message["contents"]["body"]["contents"]
-    assert project_buttons[0]["action"]["data"] == "expense:project:manual"
+    assert project_buttons[0]["action"]["data"] == "expense:project:search"
     assert project_buttons[-1]["action"]["data"] == "expense:cancel"
 
 
@@ -379,7 +385,7 @@ def test_submit_expense_adds_attachment_metadata(monkeypatch):
     monkeypatch.setattr(main.requests, "post", fake_post)
     main.submit_expense({
         "date": "2026-08-08", "project": "PJR", "payer": "周暐", "amount": 500,
-        "receiptBase64": "image", "receiptMimeType": "image/jpeg",
+        "receiptBase64": "image", "receiptMimeType": "image/jpeg", "companyTaxIdValid": True,
     })
     assert captured["transactionId"]
     assert captured["receiptFileName"].endswith(".jpg")
@@ -388,3 +394,36 @@ def test_submit_expense_adds_attachment_metadata(monkeypatch):
 def test_crane_expense_is_classified_as_project_expense():
     assert main.infer_category("PJR 專案吊車費用") == "案件支出（餐飲、道具、人員...）"
     assert main.infer_category("拍攝現場機具租賃") == "案件支出（餐飲、道具、人員...）"
+
+
+def test_seller_tax_id_cannot_pass_company_validation():
+    analysis = {"buyerTaxId": "12345678", "sellerTaxId": "90531465"}
+    assert main.has_valid_company_tax_id(analysis) is False
+    analysis["buyerTaxId"] = "9053-1465"
+    assert main.has_valid_company_tax_id(analysis) is True
+
+
+def test_invalid_company_tax_id_blocks_confirmation_without_showing_number():
+    data = {"receiptBase64": "image", "companyTaxIdValid": False, "buyerTaxId": "12345678"}
+    card = main.build_expense_confirmation(data)
+    assert card["altText"] == "公司統編未通過驗證"
+    assert "12345678" not in json.dumps(card, ensure_ascii=False)
+    assert "expense:confirm" not in json.dumps(card, ensure_ascii=False)
+
+
+def test_project_card_paginates_with_absolute_indexes():
+    projects = [{"id": str(i), "name": f"專案 {i}"} for i in range(15)]
+    first = main.project_candidate_card(projects)
+    assert first["contents"]["body"]["contents"][7]["action"]["data"] == "expense:project_page:1"
+    second = main.project_candidate_card(projects, 1)
+    assert second["contents"]["body"]["contents"][0]["action"]["data"] == "expense:project:7"
+
+
+def test_result_cards_distinguish_success_and_duplicate():
+    data = {"project": "PJR", "item": "交通", "amount": 500}
+    success = main.expense_result_card(data, {"ok": True, "recordUrl": "https://example.com/row"})
+    duplicate = main.expense_result_card(data, {"ok": True, "duplicate": True, "recordUrl": "https://example.com/old"})
+    assert success["template"]["title"] == "代墊登記完成"
+    assert any(action.get("data") == "expense:new" for action in success["template"]["actions"])
+    assert duplicate["template"]["title"] == "這張單據已登記過"
+    assert all(action.get("data") != "expense:new" for action in duplicate["template"]["actions"])
