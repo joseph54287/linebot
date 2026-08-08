@@ -98,8 +98,36 @@ def get_client_record(group_id: str) -> dict[str, Any] | None:
     return record if payload.get("ok") and isinstance(record, dict) else None
 
 
-def build_group_reply(source: dict[str, Any]) -> str:
-    """組合 Group ID、LINE 群組名稱與已綁定客戶。"""
+def upsert_client_record(
+    group_id: str,
+    group_name: str,
+    bound_by: str,
+) -> dict[str, Any]:
+    """將群組名稱同時作為客戶名稱，新增或更新共用 Google Sheet。"""
+    if not GROUP_REGISTRY_URL or not GROUP_REGISTRY_API_KEY:
+        raise requests.RequestException("group registry is not configured")
+
+    response = requests.post(
+        GROUP_REGISTRY_URL,
+        params={"key": GROUP_REGISTRY_API_KEY},
+        json={
+            "clientName": group_name,
+            "groupId": group_id,
+            "groupName": group_name,
+            "boundBy": bound_by,
+            "note": "由 LINE 的 Group ID 指令自動建立",
+        },
+        timeout=10,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not payload.get("ok"):
+        raise requests.RequestException("group registry rejected the update")
+    return payload.get("record", {})
+
+
+def build_group_reply(source: dict[str, Any], user_id: str) -> str:
+    """取得群組資料；周暐查詢時同步自動寫入 Google Sheet。"""
     if source.get("type") != "group":
         return "這則訊息不是從 LINE 群組送出，因此沒有 Group ID。"
 
@@ -113,11 +141,17 @@ def build_group_reply(source: dict[str, Any]) -> str:
         f"群組名稱：{group_name}",
     ]
 
-    record = get_client_record(group_id)
-    if record:
-        lines.append(f"客戶名稱：{record.get('clientName', '（未設定）')}")
+    # 只有周暐的指令會自動建立或更新客戶資料；其他內部成員維持查詢權限。
+    if user_id == OWNER_USER_ID:
+        record = upsert_client_record(group_id, group_name, user_id)
+        lines.append(f"客戶名稱：{record.get('clientName', group_name)}")
+        lines.append("Google Sheet：已自動登記")
     else:
-        lines.append("客戶名稱：尚未綁定")
+        record = get_client_record(group_id)
+        if record:
+            lines.append(f"客戶名稱：{record.get('clientName', '（未設定）')}")
+        else:
+            lines.append("客戶名稱：尚未綁定")
 
     return "\n".join(lines)
 
@@ -152,7 +186,7 @@ async def webhook(request: Request):
             if user_id not in INTERNAL_USER_IDS:
                 continue
             try:
-                result = build_group_reply(source)
+                result = build_group_reply(source, user_id)
             except requests.RequestException:
                 result = "目前無法取得群組資料，請稍後再試。"
         else:
