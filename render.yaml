@@ -16,6 +16,10 @@ services:
         sync: false
       - key: GROUP_REGISTRY_API_KEY
         sync: false
+      - key: EXPENSE_API_URL
+        sync: false
+      - key: EXPENSE_API_KEY
+        sync: false
       - key: OWNER_USER_ID
         value: U6c6441cb38102499d1f80d4ea79a53ab
       - key: INTERNAL_USER_IDS
