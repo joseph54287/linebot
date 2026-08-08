@@ -108,10 +108,16 @@ function expenseStats_(payer, userId) {
   const now = new Date();
   const timezone = Session.getScriptTimeZone() || 'Asia/Taipei';
   const period = Utilities.formatDate(now, timezone, 'yyyy-MM');
-  const rows = sheet.getLastRow() < 2 ? [] : sheet.getRange(2, 1, sheet.getLastRow() - 1, Math.max(24, sheet.getLastColumn())).getValues();
+  // 使用顯示值解析舊版表單時間，避免試算表地區格式讓 Date 轉換失敗。
+  const rows = sheet.getLastRow() < 2 ? [] : sheet.getRange(2, 1, sheet.getLastRow() - 1, Math.max(24, sheet.getLastColumn())).getDisplayValues();
   let count = 0, total = 0, pendingCount = 0, pendingTotal = 0, paidCount = 0, paidTotal = 0;
   rows.forEach(function(row) {
-    const belongsToUser = userId && String(row[18] || '').trim() ? String(row[18] || '').trim() === userId : String(row[6] || '').trim() === payer;
+    // 新資料優先比對 LINE User ID；舊資料則兼容「支出人」與「登記人」欄位。
+    const lineUserId = String(row[18] || '').trim();
+    const legacyRegistrant = String(row[14] || '').trim();
+    const belongsToUser = lineUserId
+      ? lineUserId === userId
+      : String(row[6] || '').trim() === payer || legacyRegistrant.indexOf(userId) >= 0 || legacyRegistrant.indexOf(payer) >= 0;
     if (!belongsToUser || normalizeExpenseDate_(row[0]).slice(0, 7) !== period) return;
     const amount = Number(String(row[5] || 0).replace(/,/g, '')) || 0;
     count += 1; total += amount;
