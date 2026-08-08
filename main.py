@@ -57,6 +57,9 @@ app = FastAPI(title="AURTOR LINE Bot")
 # Render 只暫存尚未送出的對話；完成、取消或逾時後立即清除。
 EXPENSE_SESSIONS: dict[str, dict[str, Any]] = {}
 SESSION_TTL_SECONDS = 30 * 60
+# 完成第一筆後保留專案 15 分鐘，讓員工可連續上傳整疊單據。
+EXPENSE_BATCHES: dict[str, dict[str, Any]] = {}
+BATCH_TTL_SECONDS = 15 * 60
 
 EXPENSE_CATEGORIES = [
     "案件支出（餐飲、道具、人員...）",
@@ -567,8 +570,6 @@ def missing_expense_fields(data: dict[str, Any]) -> list[str]:
         "payer": "支出人",
     }
     missing = [label for field, label in required.items() if data.get(field) in {None, ""}]
-    if data.get("receiptBase64") and data.get("companyTaxIdValid") is not True:
-        missing.append(COMPANY_TAX_ID_MISSING)
     return missing
 
 
@@ -596,6 +597,17 @@ def get_expense_session(user_id: str) -> dict[str, Any] | None:
         return None
     session["updated_at"] = time.time()
     return session
+
+
+def get_expense_batch(user_id: str) -> dict[str, Any] | None:
+    """取得仍有效的連續代墊模式；逾時即清除專案記憶。"""
+    batch = EXPENSE_BATCHES.get(user_id)
+    if not batch:
+        return None
+    if time.time() - batch["updated_at"] > BATCH_TTL_SECONDS:
+        EXPENSE_BATCHES.pop(user_id, None)
+        return None
+    return batch
 
 
 def _project_updated_at(project: dict[str, Any]) -> datetime | None:
@@ -665,8 +677,6 @@ def get_recent_open_projects(context: str = "") -> list[dict[str, Any]]:
 
 def build_project_or_missing_prompt(session: dict[str, Any], missing: list[str]) -> dict[str, Any]:
     """依缺漏欄位顯示可直接完成或取消的操作圖卡。"""
-    if COMPANY_TAX_ID_MISSING in missing:
-        return company_tax_invalid_card()
     project_label = "專案名稱（沒有專案請寫「專案無」）"
     if project_label in missing:
         context = " ".join([
@@ -716,8 +726,6 @@ def next_prompt(session: dict[str, Any]) -> dict[str, Any]:
 
 def build_expense_confirmation(data: dict[str, Any]) -> dict[str, Any]:
     """建立送出前的資料確認圖卡。"""
-    if data.get("receiptBase64") and data.get("companyTaxIdValid") is not True:
-        return company_tax_invalid_card()
     summary = "\n".join([
         f"日期：{data.get('date', '')}",
         f"專案：{data.get('project', '')}",
@@ -729,16 +737,23 @@ def build_expense_confirmation(data: dict[str, Any]) -> dict[str, Any]:
         f"公司統編：{'正確' if data.get('companyTaxIdValid') else '未驗證'}",
         f"收據：{'已附照片' if data.get('receiptBase64') else '未附'}",
     ])
+    body_contents: list[dict[str, Any]] = [{"type": "text", "text": summary, "wrap": True, "size": "sm"}]
+    if data.get("receiptBase64") and data.get("companyTaxIdValid") is not True:
+        body_contents.append({
+            "type": "text", "text": "⚠ 此單據未填寫公司統編", "wrap": True,
+            "color": "#D32F2F", "weight": "bold", "margin": "md", "size": "sm",
+        })
     return {
         "type": "flex",
         "altText": "請確認代墊資料",
         "contents": {
             "type": "bubble",
             "header": {"type": "box", "layout": "vertical", "backgroundColor": "#17365D", "contents": [{"type": "text", "text": "確認代墊資料", "color": "#FFFFFF", "weight": "bold"}]},
-            "body": {"type": "box", "layout": "vertical", "contents": [{"type": "text", "text": summary, "wrap": True, "size": "sm"}]},
+            "body": {"type": "box", "layout": "vertical", "contents": body_contents},
             "footer": {"type": "box", "layout": "vertical", "contents": [
                 {"type": "button", "style": "primary", "action": {"type": "postback", "label": "確認送出", "data": "expense:confirm", "displayText": "確認送出"}},
                 {"type": "button", "action": {"type": "postback", "label": "修改", "data": "expense:modify", "displayText": "修改代墊資料"}},
+                {"type": "button", "action": {"type": "postback", "label": "更換專案", "data": "expense:change_project", "displayText": "更換專案"}},
                 {"type": "button", "action": {"type": "postback", "label": "重新拍攝", "data": "expense:retake", "displayText": "重新拍攝收據"}},
                 {"type": "button", "action": {"type": "postback", "label": "取消登記", "data": "expense:cancel", "displayText": "取消登記"}},
             ]},
@@ -753,14 +768,16 @@ def expense_result_card(data: dict[str, Any], result: dict[str, Any]) -> dict[st
     title = "這張單據已登記過" if duplicate else "代墊登記完成"
     text = "已找到相同單據，本次沒有重複新增。" if duplicate else "\n".join([
         f"專案：{data.get('project', '')}", f"項目：{data.get('item', '')}",
-        f"金額：${data.get('amount', '')}", "收據：已儲存",
+        f"金額：${data.get('amount', '')}", "收據：已儲存", "15 分鐘內可直接傳下一張收據。",
     ])
     actions: list[dict[str, Any]] = []
     if record_url.startswith("https://"):
         actions.append({"type": "uri", "label": "查看登記資料" if not duplicate else "查看前次紀錄", "uri": record_url})
     if not duplicate:
         actions.append({"type": "postback", "label": "登記下一筆", "data": "expense:new", "displayText": "登記下一筆代墊"})
-    actions.append({"type": "postback", "label": "完成" if not duplicate else "取消", "data": "expense:cancel", "displayText": "完成"})
+        actions.append({"type": "postback", "label": "結束連續代墊", "data": "expense:end_batch", "displayText": "結束連續代墊"})
+    else:
+        actions.append({"type": "postback", "label": "取消", "data": "expense:cancel", "displayText": "取消"})
     return {"type": "template", "altText": title, "template": {"type": "buttons", "title": title, "text": text[:160], "actions": actions}}
 
 
@@ -949,7 +966,10 @@ def receipt_analysis_to_expense(
         "receiptDocumentType": str(analysis.get("documentType") or "單據"),
         "receiptConfidence": confidence,
         "receiptSecondPass": bool(analysis.get("usedSecondPass")),
+        "receiptHash": hashlib.sha256(image_base64.encode("ascii")).hexdigest(),
     }
+    if not company_tax_id_valid:
+        data["note"] = (data["note"] + "；未填寫公司統編").strip("；")
     if amount is None:
         data["note"] = (data["note"] + "；無法辨識總額，請補充金額或重新拍攝").strip("；")
     LOGGER.info(
@@ -980,8 +1000,6 @@ def process_receipt_image(user_id: str, image_base64: str, mime_type: str) -> tu
 
 def submit_expense(data: dict[str, Any]) -> dict[str, Any]:
     """交由 Google Apps Script 上傳收據並新增支出資料。"""
-    if data.get("receiptBase64") and data.get("companyTaxIdValid") is not True:
-        raise requests.RequestException("company tax id is not valid")
     if not EXPENSE_API_URL or not EXPENSE_API_KEY:
         raise requests.RequestException("expense api is not configured")
     # 同一暫存重試時沿用交易識別碼，讓 Apps Script 避免建立重複附件或資料列。
@@ -1126,6 +1144,15 @@ async def webhook(request: Request):
                 EXPENSE_SESSIONS[user_id] = {"step": "receipt_waiting_image", "updated_at": time.time(), "data": {"registrantUserId": user_id}}
                 reply_text(reply_token, "請上傳下一張完整、清楚且避免反光的收據或發票照片。")
                 continue
+            if raw_data == "expense:end_batch":
+                batch = EXPENSE_BATCHES.pop(user_id, None)
+                if not batch:
+                    reply_text(reply_token, "連續代墊模式已結束。")
+                else:
+                    notes = batch.get("notes", [])
+                    note_text = "\n".join(f"- {note}" for note in notes) if notes else "無"
+                    reply_text(reply_token, f"本次連續代墊已結束。\n共登記：{batch.get('count', 0)} 筆\n合計：${batch.get('total', 0):g}\n特別備註：\n{note_text}")
+                continue
             if not session:
                 reply_text(reply_token, "登記已逾時，請重新輸入「代墊」。")
                 continue
@@ -1199,7 +1226,24 @@ async def webhook(request: Request):
                     reply_text(reply_token, "目前無法寫入支出資料，內容已保留，請稍後再按一次「確認送出」。")
                     continue
                 EXPENSE_SESSIONS.pop(user_id, None)
+                if not result.get("duplicate"):
+                    batch = EXPENSE_BATCHES.setdefault(user_id, {"project": session["data"].get("project", ""), "count": 0, "total": 0.0, "notes": [], "hashes": []})
+                    batch["project"] = session["data"].get("project", batch.get("project", ""))
+                    batch["count"] += 1
+                    batch["total"] += float(session["data"].get("amount") or 0)
+                    batch["updated_at"] = time.time()
+                    receipt_hash = session["data"].get("receiptHash")
+                    if receipt_hash and receipt_hash not in batch["hashes"]:
+                        batch["hashes"].append(receipt_hash)
+                    if session["data"].get("companyTaxIdValid") is not True:
+                        batch["notes"].append(f"第 {batch['count']} 筆未填寫公司統編")
                 reply_messages(reply_token, [expense_result_card(session["data"], result)])
+                continue
+            elif action == "change_project":
+                session["data"]["project"] = ""
+                missing = missing_expense_fields(session["data"])
+                session["step"] = "quick_missing"
+                reply_messages(reply_token, [build_project_or_missing_prompt(session, missing)])
                 continue
             elif action == "modify":
                 session["step"] = "quick_edit"
@@ -1232,6 +1276,28 @@ async def webhook(request: Request):
                 receipt_base64, receipt_mime = download_line_image(message.get("id", ""))
             except requests.RequestException:
                 reply_text(reply_token, "收據照片讀取失敗，請重新傳送一次。")
+                continue
+
+            # 第一筆完成後的 15 分鐘內，直接把新單據帶入相同專案。
+            batch = get_expense_batch(user_id)
+            incoming_hash = hashlib.sha256(receipt_base64.encode("ascii")).hexdigest()
+            if not session and batch:
+                if incoming_hash in batch.get("hashes", []):
+                    reply_text(reply_token, "這張單據剛剛已處理過，沒有重複建立。")
+                    continue
+                try:
+                    data, missing = process_receipt_image(user_id, receipt_base64, receipt_mime)
+                except ValueError:
+                    reply_text(reply_token, "這張圖片不像發票或收據，因此沒有啟動代墊登記。")
+                    continue
+                except requests.RequestException:
+                    reply_text(reply_token, "目前無法辨識單據，請稍後重新上傳。")
+                    continue
+                data["project"] = batch.get("project", "")
+                missing = missing_expense_fields(data)
+                new_session = {"step": "quick_missing" if missing else "quick_confirm", "updated_at": time.time(), "raw_text": "", "data": data}
+                EXPENSE_SESSIONS[user_id] = new_session
+                reply_messages(reply_token, [build_project_or_missing_prompt(new_session, missing) if missing else build_expense_confirmation(data)])
                 continue
 
             # 已先輸入「代墊」時，收到圖片就立即進行辨識。

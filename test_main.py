@@ -403,12 +403,19 @@ def test_seller_tax_id_cannot_pass_company_validation():
     assert main.has_valid_company_tax_id(analysis) is True
 
 
-def test_invalid_company_tax_id_blocks_confirmation_without_showing_number():
+def test_invalid_company_tax_id_warns_without_blocking_or_showing_number():
     data = {"receiptBase64": "image", "companyTaxIdValid": False, "buyerTaxId": "12345678"}
     card = main.build_expense_confirmation(data)
-    assert card["altText"] == "公司統編未通過驗證"
+    assert card["altText"] == "請確認代墊資料"
     assert "12345678" not in json.dumps(card, ensure_ascii=False)
-    assert "expense:confirm" not in json.dumps(card, ensure_ascii=False)
+    assert "⚠ 此單據未填寫公司統編" in json.dumps(card, ensure_ascii=False)
+    assert "expense:confirm" in json.dumps(card, ensure_ascii=False)
+
+
+def test_batch_expires_after_fifteen_minutes(monkeypatch):
+    main.EXPENSE_BATCHES["U-batch"] = {"updated_at": 0, "project": "PJR"}
+    monkeypatch.setattr(main.time, "time", lambda: main.BATCH_TTL_SECONDS + 1)
+    assert main.get_expense_batch("U-batch") is None
 
 
 def test_project_card_paginates_with_absolute_indexes():

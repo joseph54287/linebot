@@ -11,9 +11,6 @@ function doPost(e) {
 }
 
 function saveExpense_(expense) {
-  if (expense.companyTaxIdValid !== true || normalizeDigits_(expense.companyTaxId) !== COMPANY_TAX_ID_) {
-    return json_({ ok: false, error: 'company_tax_id_invalid' });
-  }
   const sheet = SpreadsheetApp.openById(EXPENSE_SHEET_ID_).getSheetByName(EXPENSE_SHEET_NAME_);
   if (!sheet) return json_({ ok: false, error: 'expense_sheet_not_found' });
 
@@ -31,7 +28,7 @@ function saveExpense_(expense) {
     now, expense.month || '', expense.date || '', expense.category || '', expense.item || '',
     expense.amount || '', expense.payer || '', expense.payment || '', expense.reimbursed || '',
     receiptUrl, expense.invoice || '', expense.note || '', expense.project || '', expense.month || '',
-    expense.registrantName || '', transactionId, invoiceNumber, true,
+    expense.registrantName || '', transactionId, invoiceNumber, expense.companyTaxIdValid === true,
   ]);
   const row = sheet.getLastRow();
   return json_({ ok: true, duplicate: false, row: row, receiptUrl: receiptUrl, recordUrl: expenseRecordUrl_(sheet, row) });
