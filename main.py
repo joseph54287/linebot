@@ -115,7 +115,7 @@ def upsert_client_record(
             "groupId": group_id,
             "groupName": group_name,
             "boundBy": bound_by,
-            "note": "由 LINE 的 Group ID 指令自動建立",
+            "note": "由 LINE 的 ID 指令自動建立",
         },
         timeout=10,
     )
@@ -181,8 +181,8 @@ async def webhook(request: Request):
 
         if command == "my id":
             result = f"User ID：{user_id}" if user_id else "目前無法取得 User ID。"
-        elif command in {"group id", "group_id", "groupid"}:
-            # Group ID 是內部資料，只讓已登記的三位夥伴查詢。
+        elif command == "id":
+            # ID 指令會回傳 Group ID；內部資料只讓已登記的三位夥伴查詢。
             if user_id not in INTERNAL_USER_IDS:
                 continue
             try:
