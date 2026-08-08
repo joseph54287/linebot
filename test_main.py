@@ -152,3 +152,8 @@ def test_receipt_does_not_guess_missing_total():
     assert data["amount"] is None
     assert "金額" in missing
     assert "影像辨識信心較低" in data["note"]
+
+
+def test_crane_expense_is_classified_as_project_expense():
+    assert main.infer_category("PJR 專案吊車費用") == "案件支出（餐飲、道具、人員...）"
+    assert main.infer_category("拍攝現場機具租賃") == "案件支出（餐飲、道具、人員...）"
