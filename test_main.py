@@ -439,12 +439,14 @@ def test_recent_project_is_kept_for_twenty_four_hours(monkeypatch):
     assert main.get_recent_expense_project("U-recent") == ""
 
 
-def test_batch_summary_has_record_link_and_resume_button():
+def test_batch_summary_has_exactly_two_final_actions():
     card = main.expense_batch_summary_card({"count": 2, "total": 900, "notes": ["第 1 筆未填寫公司統編"], "recordUrls": ["https://example.com/row"]})
     actions = card["template"]["actions"]
-    assert actions[0]["label"] == "查看本批紀錄"
-    assert actions[1]["data"] == "expense:start_new"
-    assert actions[2]["data"] == "expense:finish_summary"
+    assert len(actions) == 2
+    assert actions[0]["label"] == "新的專案登記代墊"
+    assert actions[0]["data"] == "expense:start_new"
+    assert actions[1]["label"] == "完成結束"
+    assert actions[1]["data"] == "expense:finish_summary"
 
 
 def test_project_card_paginates_with_absolute_indexes():

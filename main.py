@@ -888,15 +888,13 @@ def expense_result_card(data: dict[str, Any], result: dict[str, Any]) -> dict[st
 
 
 def expense_batch_summary_card(batch: dict[str, Any]) -> dict[str, Any]:
-    """結束連續模式時回報筆數、金額、備註並提供試算表紀錄。"""
+    """結束連續模式時回報摘要，只提供開新專案或完成結束。"""
     notes = batch.get("notes", [])
     note_text = "；".join(notes) if notes else "無"
-    actions: list[dict[str, Any]] = []
-    record_urls = batch.get("recordUrls", [])
-    if record_urls and str(record_urls[-1]).startswith("https://"):
-        actions.append({"type": "uri", "label": "查看本批紀錄", "uri": record_urls[-1]})
-    actions.append({"type": "postback", "label": "開始新的代墊", "data": "expense:start_new", "displayText": "開始新的代墊"})
-    actions.append({"type": "postback", "label": "完成", "data": "expense:finish_summary", "displayText": "完成"})
+    actions: list[dict[str, Any]] = [
+        {"type": "postback", "label": "新的專案登記代墊", "data": "expense:start_new", "displayText": "新的專案登記代墊"},
+        {"type": "postback", "label": "完成結束", "data": "expense:finish_summary", "displayText": "完成結束"},
+    ]
     return {"type": "template", "altText": "連續代墊摘要", "template": {"type": "buttons", "title": "本次代墊摘要", "text": f"共登記：{batch.get('count', 0)} 筆\n合計：${float(batch.get('total', 0)):g}\n特別備註：{note_text}"[:160], "actions": actions}}
 
 
@@ -1299,12 +1297,12 @@ async def webhook(request: Request):
                 recent_project = get_recent_expense_project(user_id)
                 EXPENSE_BATCHES.pop(user_id, None)
                 EXPENSE_SESSIONS[user_id] = {"step": "receipt_waiting_image", "updated_at": time.time(), "recent_project": recent_project, "data": {"registrantUserId": user_id}}
-                reply_text(reply_token, "已開始全新的代墊批次。請上傳第一張收據，完成辨識後再確認專案。")
+                reply_text(reply_token, "已開始新的專案代墊。請上傳第一張收據，完成辨識後再確認專案。")
                 continue
             if raw_data == "expense:finish_summary":
                 EXPENSE_BATCHES.pop(user_id, None)
                 EXPENSE_SESSIONS.pop(user_id, None)
-                reply_text(reply_token, "本次代墊已完成。")
+                reply_text(reply_token, "本次代墊已完成結束。")
                 continue
             if raw_data == "expense:end_batch":
                 batch = EXPENSE_BATCHES.pop(user_id, None)
