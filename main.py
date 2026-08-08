@@ -22,6 +22,8 @@ GROUP_REGISTRY_URL = os.environ.get("GROUP_REGISTRY_URL", "").rstrip("/")
 GROUP_REGISTRY_API_KEY = os.environ.get("GROUP_REGISTRY_API_KEY", "")
 EXPENSE_API_URL = os.environ.get("EXPENSE_API_URL", GROUP_REGISTRY_URL).rstrip("/")
 EXPENSE_API_KEY = os.environ.get("EXPENSE_API_KEY", GROUP_REGISTRY_API_KEY)
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+RECEIPT_VISION_MODEL = os.environ.get("RECEIPT_VISION_MODEL", "gemini-3.6-flash")
 OWNER_USER_ID = os.environ.get(
     "OWNER_USER_ID",
     "U6c6441cb38102499d1f80d4ea79a53ab",
@@ -404,6 +406,7 @@ def build_expense_confirmation(data: dict[str, Any]) -> dict[str, Any]:
             "footer": {"type": "box", "layout": "vertical", "contents": [
                 {"type": "button", "style": "primary", "action": {"type": "postback", "label": "確認送出", "data": "expense:confirm", "displayText": "確認送出"}},
                 {"type": "button", "action": {"type": "postback", "label": "修改", "data": "expense:modify", "displayText": "修改代墊資料"}},
+                {"type": "button", "action": {"type": "postback", "label": "重新拍攝", "data": "expense:retake", "displayText": "重新拍攝收據"}},
                 {"type": "button", "action": {"type": "postback", "label": "取消登記", "data": "expense:cancel", "displayText": "取消登記"}},
             ]},
         },
@@ -423,6 +426,122 @@ def download_line_image(message_id: str) -> tuple[str, str]:
     response.raise_for_status()
     mime_type = response.headers.get("Content-Type", "image/jpeg").split(";")[0]
     return base64.b64encode(response.content).decode("ascii"), mime_type
+
+
+def parse_json_object(text: str) -> dict[str, Any]:
+    """從 Gemini 回覆中安全取出單一 JSON 物件。"""
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.IGNORECASE)
+    start, end = cleaned.find("{"), cleaned.rfind("}")
+    if start < 0 or end <= start:
+        raise ValueError("vision response is not JSON")
+    import json
+
+    payload = json.loads(cleaned[start:end + 1])
+    if not isinstance(payload, dict):
+        raise ValueError("vision response must be an object")
+    return payload
+
+
+def analyze_receipt_image(image_base64: str, mime_type: str) -> dict[str, Any]:
+    """使用 Gemini 讀取台灣發票或收據並回傳固定欄位。"""
+    if not GEMINI_API_KEY:
+        raise requests.RequestException("receipt vision is not configured")
+    prompt = """你是台灣公司支出單據辨識器。只輸出 JSON，不要 Markdown。
+辨識這張圖片是否為發票或收據，並輸出：
+documentType, merchantName, date(YYYY-MM-DD或空字串), items(字串陣列),
+totalAmount(數字或null), invoiceNumber, taxId, hasBusinessTaxId(布林值),
+currency(預設TWD), confidence(0到1), warnings(字串陣列), isReceipt(布林值)。
+totalAmount 必須是整張單據的應付或實付總額，不可使用統編、發票號碼、日期或交易序號。
+看不清楚就留空並在 warnings 說明，不要猜測。"""
+    response = requests.post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{RECEIPT_VISION_MODEL}:generateContent",
+        params={"key": GEMINI_API_KEY},
+        json={
+            "contents": [{"parts": [
+                {"text": prompt},
+                {"inlineData": {"mimeType": mime_type, "data": image_base64}},
+            ]}],
+            "generationConfig": {"temperature": 0},
+        },
+        timeout=45,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    try:
+        output = payload["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError, TypeError) as error:
+        raise requests.RequestException("receipt vision returned no result") from error
+    try:
+        return parse_json_object(output)
+    except (ValueError, TypeError) as error:
+        raise requests.RequestException("receipt vision returned invalid JSON") from error
+
+
+def receipt_analysis_to_expense(
+    analysis: dict[str, Any],
+    user_id: str,
+    image_base64: str,
+    mime_type: str,
+) -> tuple[dict[str, Any], list[str]]:
+    """驗證影像辨識結果並轉成既有 Google Sheet 支出欄位。"""
+    if not analysis.get("isReceipt"):
+        raise ValueError("圖片不像發票或收據，請重新拍攝清楚的完整單據。")
+
+    raw_amount = analysis.get("totalAmount")
+    try:
+        amount = float(str(raw_amount).replace(",", ""))
+        if amount <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        amount = None
+
+    raw_date = str(analysis.get("date") or "").strip()
+    try:
+        expense_date = datetime.strptime(raw_date, "%Y-%m-%d").date().isoformat()
+    except ValueError:
+        expense_date = ""
+
+    items = analysis.get("items") if isinstance(analysis.get("items"), list) else []
+    items = [str(item).strip() for item in items if str(item).strip()]
+    merchant = str(analysis.get("merchantName") or "").strip()
+    item = "、".join(items[:8]) or merchant
+    category = infer_category(item)
+    invoice_number = str(analysis.get("invoiceNumber") or "").strip()
+    tax_id = str(analysis.get("taxId") or "").strip()
+    warnings = analysis.get("warnings") if isinstance(analysis.get("warnings"), list) else []
+    confidence = float(analysis.get("confidence") or 0)
+    note_parts = [part for part in [f"商家：{merchant}" if merchant else "", f"發票號碼：{invoice_number}" if invoice_number else "", f"統編：{tax_id}" if tax_id else ""] if part]
+    if confidence < 0.75:
+        note_parts.append("影像辨識信心較低，已要求人工確認")
+    if warnings:
+        note_parts.append("辨識提醒：" + "；".join(map(str, warnings[:3])))
+
+    data: dict[str, Any] = {
+        "registrantUserId": user_id,
+        "date": expense_date,
+        "month": str(int(expense_date[5:7])) if expense_date else "",
+        "project": "",
+        "item": item,
+        "amount": int(amount) if amount is not None and amount.is_integer() else amount,
+        "category": category,
+        "payer": INTERNAL_USER_NAMES.get(user_id, ""),
+        "payment": "已支出",
+        "reimbursed": "否",
+        "invoice": "是" if analysis.get("hasBusinessTaxId") else "未開",
+        "note": "；".join(note_parts) or "影像收據自動辨識",
+        "receiptBase64": image_base64,
+        "receiptMimeType": mime_type,
+        "receiptDocumentType": str(analysis.get("documentType") or "單據"),
+        "receiptConfidence": confidence,
+    }
+    missing = missing_expense_fields(data)
+    return data, missing
+
+
+def process_receipt_image(user_id: str, image_base64: str, mime_type: str) -> tuple[dict[str, Any], list[str]]:
+    """完成收據辨識與欄位轉換，供 Webhook 與測試共用。"""
+    analysis = analyze_receipt_image(image_base64, mime_type)
+    return receipt_analysis_to_expense(analysis, user_id, image_base64, mime_type)
 
 
 def submit_expense(data: dict[str, Any]) -> dict[str, Any]:
@@ -592,6 +711,14 @@ async def webhook(request: Request):
                 session["step"] = "quick_edit"
                 reply_text(reply_token, "請直接說要修改的內容，例如：「金額改成 950，發票改為有統編」。")
                 continue
+            elif action == "retake":
+                EXPENSE_SESSIONS[user_id] = {
+                    "step": "receipt_waiting_image",
+                    "updated_at": time.time(),
+                    "data": {"registrantUserId": user_id},
+                }
+                reply_text(reply_token, "請重新上傳一張完整、清楚且避免反光的收據或發票照片。")
+                continue
             else:
                 continue
             reply_messages(reply_token, [next_prompt(session)])
@@ -604,13 +731,49 @@ async def webhook(request: Request):
         message_type = message.get("type")
 
         if message_type == "image" and source.get("type") == "user":
-            session = get_expense_session(user_id)
-            if not session or session.get("step") not in {"receipt", "quick_confirm", "quick_missing", "quick_edit"}:
+            if user_id not in INTERNAL_USER_IDS:
                 continue
+            session = get_expense_session(user_id)
             try:
                 receipt_base64, receipt_mime = download_line_image(message.get("id", ""))
             except requests.RequestException:
                 reply_text(reply_token, "收據照片讀取失敗，請重新傳送一次。")
+                continue
+
+            # 已先輸入「代墊」時，收到圖片就立即進行辨識。
+            if session and session.get("step") == "receipt_waiting_image":
+                try:
+                    data, missing = process_receipt_image(user_id, receipt_base64, receipt_mime)
+                except ValueError as error:
+                    reply_text(reply_token, str(error))
+                    continue
+                except requests.RequestException:
+                    session["receiptBase64"] = receipt_base64
+                    session["receiptMimeType"] = receipt_mime
+                    reply_text(reply_token, "目前無法辨識收據，圖片已保留，請稍後再輸入「代墊」重試。")
+                    continue
+                EXPENSE_SESSIONS[user_id] = {
+                    "step": "quick_missing" if missing else "quick_confirm",
+                    "updated_at": time.time(),
+                    "raw_text": "",
+                    "data": data,
+                }
+                reply_messages(reply_token, [build_missing_prompt(missing) if missing else build_expense_confirmation(data)])
+                continue
+
+            # 員工先上傳圖片時先保留，等收到「代墊」才傳送至辨識服務。
+            if not session:
+                EXPENSE_SESSIONS[user_id] = {
+                    "step": "receipt_waiting_trigger",
+                    "updated_at": time.time(),
+                    "receiptBase64": receipt_base64,
+                    "receiptMimeType": receipt_mime,
+                    "data": {"registrantUserId": user_id},
+                }
+                reply_text(reply_token, "已收到單據照片。請輸入「代墊」，我會自動辨識並填寫。")
+                continue
+
+            if session.get("step") not in {"receipt", "quick_confirm", "quick_missing", "quick_edit"}:
                 continue
             session["data"]["receiptBase64"] = receipt_base64
             session["data"]["receiptMimeType"] = receipt_mime
@@ -636,13 +799,35 @@ async def webhook(request: Request):
             if user_id not in INTERNAL_USER_IDS:
                 reply_text(reply_token, "你的帳號尚未加入公司內部登記名單。")
                 continue
-            EXPENSE_SESSIONS[user_id] = {
-                "step": "quick_missing",
-                "updated_at": time.time(),
-                "raw_text": "",
-                "data": {"registrantUserId": user_id},
-            }
-            reply_text(reply_token, "請用一句話輸入，例如：\n代墊 TOYOTA 拍攝餐費 850 元，我先付，沒收據")
+            session = get_expense_session(user_id)
+            if session and session.get("step") == "receipt_waiting_trigger":
+                try:
+                    data, missing = process_receipt_image(
+                        user_id,
+                        session["receiptBase64"],
+                        session["receiptMimeType"],
+                    )
+                except ValueError as error:
+                    EXPENSE_SESSIONS.pop(user_id, None)
+                    reply_text(reply_token, str(error))
+                    continue
+                except requests.RequestException:
+                    reply_text(reply_token, "目前無法辨識收據，圖片已保留，請稍後再輸入「代墊」重試。")
+                    continue
+                EXPENSE_SESSIONS[user_id] = {
+                    "step": "quick_missing" if missing else "quick_confirm",
+                    "updated_at": time.time(),
+                    "raw_text": "",
+                    "data": data,
+                }
+                reply_messages(reply_token, [build_missing_prompt(missing) if missing else build_expense_confirmation(data)])
+            else:
+                EXPENSE_SESSIONS[user_id] = {
+                    "step": "receipt_waiting_image",
+                    "updated_at": time.time(),
+                    "data": {"registrantUserId": user_id},
+                }
+                reply_text(reply_token, "請上傳一張完整、清楚且避免反光的收據或發票照片，我會自動辨識。")
             continue
 
         session = get_expense_session(user_id) if source.get("type") == "user" else None
@@ -743,6 +928,7 @@ async def health():
             GROUP_REGISTRY_URL and GROUP_REGISTRY_API_KEY
         ),
         "expense_configured": bool(EXPENSE_API_URL and EXPENSE_API_KEY),
+        "receipt_vision_configured": bool(GEMINI_API_KEY),
         "internal_user_count": len(INTERNAL_USER_IDS),
         "owner_configured": bool(OWNER_USER_ID),
     }

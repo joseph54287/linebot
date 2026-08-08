@@ -16,6 +16,8 @@
 ```
 
 資料不足時，Bot 會一次列出所有缺漏欄位，不會重新逐題詢問。
+
+也可直接上傳發票或收據照片，再輸入 `代墊`。Bot 會辨識日期、商家、品項、總額與統編狀態，並用確認圖卡完成登記。
 - 提供 `/health` 健康檢查
 
 ## Render 環境變數
@@ -28,6 +30,8 @@
 - `GROUP_REGISTRY_API_KEY`
 - `EXPENSE_API_URL`（Google Apps Script 支出寫入端點）
 - `EXPENSE_API_KEY`
+- `GEMINI_API_KEY`（收據影像辨識）
+- `RECEIPT_VISION_MODEL`（預設 `gemini-3.6-flash`）
 
 ## Webhook
 
