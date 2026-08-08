@@ -60,6 +60,8 @@ SESSION_TTL_SECONDS = 30 * 60
 # 完成第一筆後保留專案 15 分鐘，讓員工可連續上傳整疊單據。
 EXPENSE_BATCHES: dict[str, dict[str, Any]] = {}
 BATCH_TTL_SECONDS = 15 * 60
+RECENT_EXPENSE_PROJECTS: dict[str, dict[str, Any]] = {}
+RECENT_PROJECT_TTL_SECONDS = 24 * 60 * 60
 
 EXPENSE_CATEGORIES = [
     "案件支出（餐飲、道具、人員...）",
@@ -601,7 +603,7 @@ def get_expense_stats(user_id: str) -> dict[str, Any]:
     if not EXPENSE_API_URL or not EXPENSE_API_KEY:
         raise requests.RequestException("expense api is not configured")
     payer = INTERNAL_USER_NAMES.get(user_id, "")
-    response = requests.get(EXPENSE_API_URL, params={"key": EXPENSE_API_KEY, "action": "expense_stats", "payer": payer}, timeout=20)
+    response = requests.get(EXPENSE_API_URL, params={"key": EXPENSE_API_KEY, "action": "expense_stats", "payer": payer, "userId": user_id}, timeout=20)
     response.raise_for_status()
     payload = response.json()
     if not payload.get("ok"):
@@ -642,6 +644,21 @@ def get_expense_batch(user_id: str) -> dict[str, Any] | None:
         EXPENSE_BATCHES.pop(user_id, None)
         return None
     return batch
+
+
+def get_recent_expense_project(user_id: str) -> str:
+    """保留最近一次成功專案 24 小時，供員工快速恢復連續代墊。"""
+    record = RECENT_EXPENSE_PROJECTS.get(user_id)
+    if not record or time.time() - record["updated_at"] > RECENT_PROJECT_TTL_SECONDS:
+        RECENT_EXPENSE_PROJECTS.pop(user_id, None)
+        return ""
+    return str(record.get("project") or "")
+
+
+def looks_like_resume_expense(text: str) -> bool:
+    """辨識繼續上一個／同一個專案的自然說法。"""
+    folded = re.sub(r"\s+", "", text.casefold())
+    return "繼續" in folded and any(word in folded for word in ["上一個專案", "這個專案", "同一個專案", "剛剛的專案", "代墊"])
 
 
 def _project_updated_at(project: dict[str, Any]) -> datetime | None:
@@ -813,6 +830,18 @@ def expense_result_card(data: dict[str, Any], result: dict[str, Any]) -> dict[st
     else:
         actions.append({"type": "postback", "label": "取消", "data": "expense:cancel", "displayText": "取消"})
     return {"type": "template", "altText": title, "template": {"type": "buttons", "title": title, "text": text[:160], "actions": actions}}
+
+
+def expense_batch_summary_card(batch: dict[str, Any]) -> dict[str, Any]:
+    """結束連續模式時回報筆數、金額、備註並提供試算表紀錄。"""
+    notes = batch.get("notes", [])
+    note_text = "；".join(notes) if notes else "無"
+    actions: list[dict[str, Any]] = []
+    record_urls = batch.get("recordUrls", [])
+    if record_urls and str(record_urls[-1]).startswith("https://"):
+        actions.append({"type": "uri", "label": "查看本批紀錄", "uri": record_urls[-1]})
+    actions.append({"type": "postback", "label": "繼續上一個專案", "data": "expense:resume_recent", "displayText": "繼續上一個專案"})
+    return {"type": "template", "altText": "連續代墊摘要", "template": {"type": "buttons", "title": "本次代墊摘要", "text": f"共登記：{batch.get('count', 0)} 筆\n合計：${float(batch.get('total', 0)):g}\n特別備註：{note_text}"[:160], "actions": actions}}
 
 
 def get_line_profile_name(user_id: str) -> str:
@@ -1175,17 +1204,25 @@ async def webhook(request: Request):
                 reply_text(reply_token, "本次代墊登記已取消。")
                 continue
             if raw_data == "expense:new":
-                EXPENSE_SESSIONS[user_id] = {"step": "receipt_waiting_image", "updated_at": time.time(), "data": {"registrantUserId": user_id}}
-                reply_text(reply_token, "請上傳下一張完整、清楚且避免反光的收據或發票照片。")
+                project = (get_expense_batch(user_id) or {}).get("project") or get_recent_expense_project(user_id)
+                EXPENSE_SESSIONS[user_id] = {"step": "receipt_waiting_image", "updated_at": time.time(), "data": {"registrantUserId": user_id, "project": project}}
+                reply_text(reply_token, f"請上傳下一張收據。{'目前沿用專案：' + project if project else ''}")
+                continue
+            if raw_data == "expense:resume_recent":
+                project = get_recent_expense_project(user_id)
+                if not project:
+                    reply_text(reply_token, "最近 24 小時沒有可沿用的專案，請先輸入「代墊」開始新登記。")
+                    continue
+                EXPENSE_BATCHES[user_id] = {"project": project, "count": 0, "total": 0.0, "notes": [], "hashes": [], "recordUrls": [], "updated_at": time.time()}
+                EXPENSE_SESSIONS[user_id] = {"step": "receipt_waiting_image", "updated_at": time.time(), "data": {"registrantUserId": user_id, "project": project}}
+                reply_text(reply_token, f"已恢復專案「{project}」。請直接上傳下一張收據，不需要填寫消費項目。")
                 continue
             if raw_data == "expense:end_batch":
                 batch = EXPENSE_BATCHES.pop(user_id, None)
                 if not batch:
                     reply_text(reply_token, "連續代墊模式已結束。")
                 else:
-                    notes = batch.get("notes", [])
-                    note_text = "\n".join(f"- {note}" for note in notes) if notes else "無"
-                    reply_text(reply_token, f"本次連續代墊已結束。\n共登記：{batch.get('count', 0)} 筆\n合計：${batch.get('total', 0):g}\n特別備註：\n{note_text}")
+                    reply_messages(reply_token, [expense_batch_summary_card(batch)])
                 continue
             if not session:
                 reply_text(reply_token, "登記已逾時，請重新輸入「代墊」。")
@@ -1261,11 +1298,14 @@ async def webhook(request: Request):
                     continue
                 EXPENSE_SESSIONS.pop(user_id, None)
                 if not result.get("duplicate"):
-                    batch = EXPENSE_BATCHES.setdefault(user_id, {"project": session["data"].get("project", ""), "count": 0, "total": 0.0, "notes": [], "hashes": []})
+                    batch = EXPENSE_BATCHES.setdefault(user_id, {"project": session["data"].get("project", ""), "count": 0, "total": 0.0, "notes": [], "hashes": [], "recordUrls": []})
                     batch["project"] = session["data"].get("project", batch.get("project", ""))
                     batch["count"] += 1
                     batch["total"] += float(session["data"].get("amount") or 0)
                     batch["updated_at"] = time.time()
+                    RECENT_EXPENSE_PROJECTS[user_id] = {"project": batch["project"], "updated_at": time.time()}
+                    if result.get("recordUrl"):
+                        batch.setdefault("recordUrls", []).append(result["recordUrl"])
                     receipt_hash = session["data"].get("receiptHash")
                     if receipt_hash and receipt_hash not in batch["hashes"]:
                         batch["hashes"].append(receipt_hash)
@@ -1346,6 +1386,10 @@ async def webhook(request: Request):
                     session["receiptMimeType"] = receipt_mime
                     reply_text(reply_token, "目前無法辨識收據，圖片已保留，請稍後再輸入「代墊」重試。")
                     continue
+                remembered_project = session.get("data", {}).get("project") or (get_expense_batch(user_id) or {}).get("project")
+                if remembered_project:
+                    data["project"] = remembered_project
+                    missing = missing_expense_fields(data)
                 EXPENSE_SESSIONS[user_id] = {
                     "step": "quick_missing" if missing else "quick_confirm",
                     "updated_at": time.time(),
@@ -1385,6 +1429,16 @@ async def webhook(request: Request):
 
         text = message.get("text", "").strip()
         command = text.casefold()
+
+        if source.get("type") == "user" and user_id in INTERNAL_USER_IDS and looks_like_resume_expense(text):
+            project = get_recent_expense_project(user_id)
+            if not project:
+                reply_text(reply_token, "最近 24 小時沒有可沿用的專案，請先輸入「代墊」開始新登記。")
+                continue
+            EXPENSE_BATCHES[user_id] = {"project": project, "count": 0, "total": 0.0, "notes": [], "hashes": [], "recordUrls": [], "updated_at": time.time()}
+            EXPENSE_SESSIONS[user_id] = {"step": "receipt_waiting_image", "updated_at": time.time(), "data": {"registrantUserId": user_id, "project": project}}
+            reply_text(reply_token, f"已恢復專案「{project}」。請直接上傳下一張收據，不需要填寫消費項目。")
+            continue
 
         # 查詢意圖優先於「代墊」關鍵字，絕不建立或修改登記暫存。
         if source.get("type") == "user" and user_id in INTERNAL_USER_IDS and looks_like_expense_query(text):

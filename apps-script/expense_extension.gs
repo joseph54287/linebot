@@ -6,7 +6,7 @@ const COMPANY_TAX_ID_ = '90531465';
 function doGet(e) {
   if (!authorized_(e)) return json_({ ok: false, error: 'unauthorized' });
   if (String((e && e.parameter && e.parameter.action) || '') !== 'expense_stats') return doGetGroup_(e);
-  return expenseStats_(String(e.parameter.payer || '').trim());
+  return expenseStats_(String(e.parameter.payer || '').trim(), String(e.parameter.userId || '').trim());
 }
 
 function doPost(e) {
@@ -19,6 +19,7 @@ function doPost(e) {
 function saveExpense_(expense) {
   const sheet = SpreadsheetApp.openById(EXPENSE_SHEET_ID_).getSheetByName(EXPENSE_SHEET_NAME_);
   if (!sheet) return json_({ ok: false, error: 'expense_sheet_not_found' });
+  ensureExpenseMetadataHeaders_(sheet);
 
   const transactionId = String(expense.transactionId || '').trim();
   const invoiceNumber = String(expense.invoiceNumber || '').replace(/[^0-9A-Za-z]/g, '').toUpperCase();
@@ -34,23 +35,25 @@ function saveExpense_(expense) {
     now, expense.month || '', expense.date || '', expense.category || '', expense.item || '',
     expense.amount || '', expense.payer || '', expense.payment || '', expense.reimbursed || '',
     receiptUrl, expense.invoice || '', expense.note || '', expense.project || '', expense.month || '',
-    expense.registrantName || '', transactionId, invoiceNumber, expense.companyTaxIdValid === true,
+    expense.registrantName || '', transactionId, invoiceNumber,
+    expense.companyTaxIdValid === true ? '正確' : '未填公司統編', expense.registrantUserId || '',
   ]);
   const row = sheet.getLastRow();
   return json_({ ok: true, duplicate: false, row: row, receiptUrl: receiptUrl, recordUrl: expenseRecordUrl_(sheet, row) });
 }
 
-function expenseStats_(payer) {
+function expenseStats_(payer, userId) {
   if (!payer) return json_({ ok: false, error: 'payer_required' });
   const sheet = SpreadsheetApp.openById(EXPENSE_SHEET_ID_).getSheetByName(EXPENSE_SHEET_NAME_);
   if (!sheet) return json_({ ok: false, error: 'expense_sheet_not_found' });
   const now = new Date();
   const timezone = Session.getScriptTimeZone() || 'Asia/Taipei';
   const period = Utilities.formatDate(now, timezone, 'yyyy-MM');
-  const rows = sheet.getLastRow() < 2 ? [] : sheet.getRange(2, 1, sheet.getLastRow() - 1, Math.max(18, sheet.getLastColumn())).getValues();
+  const rows = sheet.getLastRow() < 2 ? [] : sheet.getRange(2, 1, sheet.getLastRow() - 1, Math.max(19, sheet.getLastColumn())).getValues();
   let count = 0, total = 0, pendingCount = 0, pendingTotal = 0, paidCount = 0, paidTotal = 0;
   rows.forEach(function(row) {
-    if (String(row[6] || '').trim() !== payer || normalizeExpenseDate_(row[2]).slice(0, 7) !== period) return;
+    const belongsToUser = userId && String(row[18] || '').trim() ? String(row[18] || '').trim() === userId : String(row[6] || '').trim() === payer;
+    if (!belongsToUser || normalizeExpenseDate_(row[2]).slice(0, 7) !== period) return;
     const amount = Number(String(row[5] || 0).replace(/,/g, '')) || 0;
     count += 1; total += amount;
     if (String(row[8] || '').trim() === '是') { paidCount += 1; paidTotal += amount; }
@@ -59,10 +62,17 @@ function expenseStats_(payer) {
   return json_({ ok: true, period: period, count: count, total: total, pendingCount: pendingCount, pendingTotal: pendingTotal, paidCount: paidCount, paidTotal: paidTotal });
 }
 
+function ensureExpenseMetadataHeaders_(sheet) {
+  const headers = ['交易識別碼', '發票號碼', '統編狀態', 'LINE User ID'];
+  const range = sheet.getRange(1, 16, 1, headers.length);
+  const current = range.getValues()[0];
+  range.setValues([[current[0] || headers[0], current[1] || headers[1], current[2] || headers[2], current[3] || headers[3]]]);
+}
+
 function findDuplicateExpense_(sheet, expense, transactionId, invoiceNumber) {
   const lastRow = sheet.getLastRow();
   if (lastRow < 2) return 0;
-  const values = sheet.getRange(2, 1, lastRow - 1, Math.max(18, sheet.getLastColumn())).getValues();
+  const values = sheet.getRange(2, 1, lastRow - 1, Math.max(19, sheet.getLastColumn())).getValues();
   const targetDate = normalizeExpenseDate_(expense.date);
   const targetAmount = Number(expense.amount || 0);
   const targetPayer = String(expense.payer || '').trim();
