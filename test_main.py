@@ -1,6 +1,143 @@
 """代墊登記核心流程測試。"""
 
+import asyncio
+import json
+
 import main
+from starlette.requests import Request
+
+
+QUOTE_USER_ID = "Ub983deb79584603885e5b28e9fdf2d5d"
+
+
+def quote_event(event_type="postback", user_id=QUOTE_USER_ID, source_type="user"):
+    """建立報價事件測試資料，避免各案例重複組裝 payload。"""
+    event = {
+        "type": event_type,
+        "source": {"type": source_type, "userId": user_id},
+    }
+    if event_type == "postback":
+        event["postback"] = {
+            "data": "action=scheme&invitation=inv-123&scheme=A",
+        }
+    else:
+        event["message"] = {"type": "text", "text": "確認"}
+    return event
+
+
+def test_quote_scheme_postback_is_limited_to_owner_and_valid_schemes():
+    event = quote_event()
+    assert main.is_quote_event(event) is True
+
+    event["postback"]["data"] = "action=scheme&invitation=inv-123&scheme=C"
+    assert main.is_quote_event(event) is True
+
+    event["postback"]["data"] = "action=scheme&invitation=inv-123&scheme=D"
+    assert main.is_quote_event(event) is False
+    assert main.is_quote_event(quote_event(user_id="U-other")) is False
+    assert main.is_quote_event(quote_event(source_type="group")) is False
+
+
+def test_quote_text_requires_explicit_confirmation_or_full_subject():
+    event = quote_event(event_type="message")
+    for text in ["確認", "送出", "主旨：Re: 測試報價"]:
+        event["message"]["text"] = text
+        assert main.is_quote_event(event) is True
+
+    for text in ["確認一下", "報價", "主旨: 半形冒號", "代墊"]:
+        event["message"]["text"] = text
+        assert main.is_quote_event(event) is False
+
+    event["message"] = {"type": "image", "id": "image-1"}
+    assert main.is_quote_event(event) is False
+
+
+def test_forward_quote_webhook_preserves_raw_body_and_signature(monkeypatch):
+    calls = []
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+    def fake_post(url, **kwargs):
+        calls.append((url, kwargs))
+        return Response()
+
+    monkeypatch.setattr(main.requests, "post", fake_post)
+    body = b'{"events": [{"type": "postback"}]}'
+
+    assert main.forward_quote_webhook(body, "original-signature") is True
+    assert len(calls) == 1
+    assert calls[0][1]["data"] is body
+    assert calls[0][1]["headers"]["X-Line-Signature"] == "original-signature"
+    assert calls[0][1]["timeout"] == 20
+
+
+def test_forward_quote_webhook_does_not_retry_on_failure(monkeypatch):
+    calls = []
+
+    def failing_post(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise main.requests.Timeout("timeout")
+
+    monkeypatch.setattr(main.requests, "post", failing_post)
+
+    assert main.forward_quote_webhook(b"raw", "signature") is False
+    assert len(calls) == 1
+
+
+def test_mixed_batch_forwards_once_and_keeps_existing_event(monkeypatch):
+    payload = {
+        "events": [
+            quote_event(event_type="message"),
+            {
+                "type": "message",
+                "replyToken": "reply-my-id",
+                "source": {"type": "user", "userId": "U-other"},
+                "message": {"type": "text", "text": "My ID"},
+            },
+        ],
+    }
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    forwarded = []
+    replies = []
+
+    monkeypatch.setattr(main, "verify_signature", lambda raw, signature: True)
+    monkeypatch.setattr(
+        main,
+        "forward_quote_webhook",
+        lambda raw, signature: forwarded.append((raw, signature)) or True,
+    )
+    monkeypatch.setattr(
+        main,
+        "reply_text",
+        lambda token, text: replies.append((token, text)),
+    )
+
+    delivered = False
+
+    async def receive():
+        nonlocal delivered
+        if delivered:
+            return {"type": "http.disconnect"}
+        delivered = True
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/webhook",
+            "headers": [(b"x-line-signature", b"original-signature")],
+        },
+        receive,
+    )
+
+    response = asyncio.run(main.webhook(request))
+
+    assert response == {"status": "ok"}
+    assert forwarded == [(body, "original-signature")]
+    assert replies == [("reply-my-id", "User ID：U-other")]
 
 
 def test_new_session_starts_with_date():
