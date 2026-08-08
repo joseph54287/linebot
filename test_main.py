@@ -463,3 +463,22 @@ def test_result_cards_distinguish_success_and_duplicate():
     assert any(action.get("data") == "expense:new" for action in success["template"]["actions"])
     assert duplicate["template"]["title"] == "這張單據已登記過"
     assert all(action.get("data") != "expense:new" for action in duplicate["template"]["actions"])
+
+
+def test_supplement_list_and_detail_cards():
+    items = [{"row": 12, "date": "2026-08-08", "project": "PJR", "amount": 500, "reasons": ["缺少統編", "圖片不清楚"]}]
+    listing = main.supplement_list_card(items)
+    assert listing["contents"]["body"]["contents"][0]["action"]["data"] == "supplement:select:12"
+    detail = main.supplement_detail_card(items[0])
+    payload = json.dumps(detail, ensure_ascii=False)
+    assert "supplement:accept_no_tax:12" in payload
+    assert "supplement:retake:12" in payload
+
+
+def test_empty_supplement_list_is_clear():
+    assert main.supplement_list_card([])["text"] == "目前沒有待補件資料。"
+
+
+def test_duplicate_card_shows_original_registrant():
+    card = main.expense_result_card({}, {"duplicate": True, "original": {"date": "2026-08-08", "project": "PJR", "amount": 500, "registrantName": "高爾賢"}})
+    assert "高爾賢" in card["template"]["text"]

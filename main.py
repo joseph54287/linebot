@@ -623,6 +623,59 @@ def expense_stats_card(stats: dict[str, Any]) -> dict[str, Any]:
     return {"type": "flex", "altText": "我的代墊統計", "contents": {"type": "bubble", "header": {"type": "box", "layout": "vertical", "backgroundColor": "#17365D", "contents": [{"type": "text", "text": "我的代墊統計", "color": "#FFFFFF", "weight": "bold"}]}, "body": {"type": "box", "layout": "vertical", "contents": [{"type": "text", "text": summary, "wrap": True}]}}}
 
 
+def get_supplements(user_id: str) -> list[dict[str, Any]]:
+    """取得員工自己的待補件清單。"""
+    payer = INTERNAL_USER_NAMES.get(user_id, "")
+    response = requests.get(EXPENSE_API_URL, params={"key": EXPENSE_API_KEY, "action": "supplements", "payer": payer, "userId": user_id}, timeout=20)
+    response.raise_for_status()
+    payload = response.json()
+    if not payload.get("ok"):
+        raise requests.RequestException("supplement list rejected")
+    return payload.get("items", []) if isinstance(payload.get("items"), list) else []
+
+
+def submit_supplement(user_id: str, row: int, **updates: Any) -> dict[str, Any]:
+    """只更新本人原資料列，不建立新的代墊。"""
+    supplement = {"userId": user_id, "payer": INTERNAL_USER_NAMES.get(user_id, ""), "row": row, **updates}
+    response = requests.post(EXPENSE_API_URL, params={"key": EXPENSE_API_KEY}, json={"action": "supplement", "supplement": supplement}, timeout=30)
+    response.raise_for_status()
+    payload = response.json()
+    if not payload.get("ok"):
+        raise requests.RequestException("supplement update rejected")
+    return payload
+
+
+def supplement_list_card(items: list[dict[str, Any]]) -> dict[str, Any]:
+    """列出最多十筆待補件資料。"""
+    if not items:
+        return {"type": "text", "text": "目前沒有待補件資料。"}
+    buttons = []
+    for item in items[:10]:
+        reasons = "、".join(map(str, item.get("reasons") or []))
+        label = f"{item.get('project') or '未定專案'}｜${item.get('amount', 0)}"[:20]
+        buttons.append({"type": "button", "height": "sm", "style": "secondary", "action": {"type": "postback", "label": label, "data": f"supplement:select:{item.get('row')}", "displayText": f"補件：{label}（{reasons}）"}})
+    return {"type": "flex", "altText": "我的待補件", "contents": {"type": "bubble", "header": {"type": "box", "layout": "vertical", "backgroundColor": "#17365D", "contents": [{"type": "text", "text": "我的待補件", "color": "#FFFFFF", "weight": "bold"}]}, "body": {"type": "box", "layout": "vertical", "contents": buttons}}}
+
+
+def supplement_detail_card(item: dict[str, Any]) -> dict[str, Any]:
+    """依缺漏原因提供可直接完成的操作。"""
+    row = int(item.get("row") or 0)
+    reasons = list(map(str, item.get("reasons") or []))
+    actions: list[dict[str, Any]] = []
+    if "缺少統編" in reasons:
+        actions.append({"type": "postback", "label": "維持無統編", "data": f"supplement:accept_no_tax:{row}", "displayText": "維持無統編"})
+    if any(reason in reasons for reason in ["缺少統編", "缺少收據", "圖片不清楚"]):
+        actions.append({"type": "postback", "label": "重新上傳單據", "data": f"supplement:retake:{row}", "displayText": "重新上傳單據"})
+    if "專案待確認" in reasons:
+        actions.append({"type": "postback", "label": "補專案名稱", "data": f"supplement:project:{row}", "displayText": "補專案名稱"})
+    if "金額需要確認" in reasons:
+        actions.append({"type": "postback", "label": "確認金額", "data": f"supplement:amount:{row}", "displayText": "確認金額"})
+    actions.append({"type": "postback", "label": "取消", "data": "supplement:cancel:0", "displayText": "取消補件"})
+    text = f"日期：{item.get('date') or '未辨識'}\n專案：{item.get('project') or '未確認'}\n金額：${item.get('amount', 0)}\n缺漏：{'、'.join(reasons)}"
+    buttons = [{"type": "button", "height": "sm", "style": "primary" if index == 0 else "secondary", "action": action} for index, action in enumerate(actions)]
+    return {"type": "flex", "altText": "選擇補件方式", "contents": {"type": "bubble", "header": {"type": "box", "layout": "vertical", "backgroundColor": "#17365D", "contents": [{"type": "text", "text": "補件資料", "color": "#FFFFFF", "weight": "bold"}]}, "body": {"type": "box", "layout": "vertical", "contents": [{"type": "text", "text": text, "wrap": True, "size": "sm"}, *buttons]}}}
+
+
 def get_expense_session(user_id: str) -> dict[str, Any] | None:
     """取得未逾時的代墊登記暫存。"""
     session = EXPENSE_SESSIONS.get(user_id)
@@ -814,7 +867,12 @@ def expense_result_card(data: dict[str, Any], result: dict[str, Any]) -> dict[st
     duplicate = bool(result.get("duplicate"))
     record_url = str(result.get("recordUrl") or "").strip()
     title = "這張單據已登記過" if duplicate else "代墊登記完成"
-    text = "已找到相同單據，本次沒有重複新增。" if duplicate else "\n".join([
+    original = result.get("original") if isinstance(result.get("original"), dict) else {}
+    text = "\n".join([
+        "這張單據可能已由其他人登記。",
+        f"日期：{original.get('date', '')}", f"專案：{original.get('project', '')}",
+        f"金額：${original.get('amount', '')}", f"登記人：{original.get('registrantName', '')}",
+    ]) if duplicate else "\n".join([
         f"專案：{data.get('project', '')}", f"項目：{data.get('item', '')}",
         f"金額：${data.get('amount', '')}", "收據：已儲存", "15 分鐘內可直接傳下一張收據。",
     ])
@@ -1194,6 +1252,37 @@ async def webhook(request: Request):
                 continue
             postback = event.get("postback", {})
             raw_data = postback.get("data", "")
+            if raw_data.startswith("supplement:"):
+                parts = raw_data.split(":", 2)
+                action = parts[1]
+                try:
+                    row = int(parts[2])
+                except (ValueError, IndexError):
+                    row = 0
+                if action == "cancel":
+                    EXPENSE_SESSIONS.pop(user_id, None)
+                    reply_text(reply_token, "已取消補件。")
+                    continue
+                if action == "select":
+                    try:
+                        item = next(item for item in get_supplements(user_id) if int(item.get("row") or 0) == row)
+                        reply_messages(reply_token, [supplement_detail_card(item)])
+                    except (requests.RequestException, StopIteration):
+                        reply_text(reply_token, "這筆資料已完成或目前無法讀取，請重新輸入「我的待補件」。")
+                    continue
+                if action == "accept_no_tax":
+                    try:
+                        result = submit_supplement(user_id, row, acceptNoTax=True)
+                        reply_text(reply_token, "已記錄為維持無統編。" if result.get("complete") else "已更新，仍有其他資料需要補件。")
+                    except requests.RequestException:
+                        reply_text(reply_token, "補件更新失敗，請稍後再試。")
+                    continue
+                if action in {"retake", "project", "amount"}:
+                    step = {"retake": "supplement_image", "project": "supplement_project", "amount": "supplement_amount"}[action]
+                    EXPENSE_SESSIONS[user_id] = {"step": step, "supplement_row": row, "updated_at": time.time(), "data": {"registrantUserId": user_id}}
+                    prompt = {"retake": "請重新上傳清楚、完整的單據照片。", "project": "請輸入正確的專案名稱。", "amount": "請輸入正確金額，只輸入數字即可。"}[action]
+                    reply_text(reply_token, prompt)
+                    continue
             if not raw_data.startswith("expense:"):
                 continue
             session = get_expense_session(user_id)
@@ -1352,6 +1441,22 @@ async def webhook(request: Request):
                 reply_text(reply_token, "收據照片讀取失敗，請重新傳送一次。")
                 continue
 
+            if session and session.get("step") == "supplement_image":
+                try:
+                    data, _ = process_receipt_image(user_id, receipt_base64, receipt_mime)
+                    result = submit_supplement(
+                        user_id, int(session.get("supplement_row") or 0),
+                        receiptBase64=receipt_base64, receiptMimeType=receipt_mime,
+                        receiptHash=data.get("receiptHash"), companyTaxIdValid=data.get("companyTaxIdValid"),
+                        receiptFileName=f"補件_{int(session.get('supplement_row') or 0)}.jpg",
+                    )
+                except (ValueError, requests.RequestException):
+                    reply_text(reply_token, "單據辨識或補件更新失敗，請重新拍攝後再試。")
+                    continue
+                EXPENSE_SESSIONS.pop(user_id, None)
+                reply_text(reply_token, "補件完成。" if result.get("complete") else "照片已更新，仍有其他資料需要補件。")
+                continue
+
             # 第一筆完成後的 15 分鐘內，直接把新單據帶入相同專案。
             batch = get_expense_batch(user_id)
             incoming_hash = hashlib.sha256(receipt_base64.encode("ascii")).hexdigest()
@@ -1430,6 +1535,30 @@ async def webhook(request: Request):
 
         text = message.get("text", "").strip()
         command = text.casefold()
+
+        session = get_expense_session(user_id) if source.get("type") == "user" else None
+        if session and session.get("step") in {"supplement_project", "supplement_amount"}:
+            try:
+                if session["step"] == "supplement_project":
+                    result = submit_supplement(user_id, int(session["supplement_row"]), project=text)
+                else:
+                    amount = float(text.replace(",", "").replace("$", ""))
+                    if amount <= 0:
+                        raise ValueError
+                    result = submit_supplement(user_id, int(session["supplement_row"]), amount=amount)
+            except (ValueError, requests.RequestException):
+                reply_text(reply_token, "補件內容格式不正確或更新失敗，請重新輸入。")
+                continue
+            EXPENSE_SESSIONS.pop(user_id, None)
+            reply_text(reply_token, "補件完成。" if result.get("complete") else "已更新，仍有其他資料需要補件。")
+            continue
+
+        if source.get("type") == "user" and user_id in INTERNAL_USER_IDS and command in {"我的待補件", "待補件", "查詢待補件"}:
+            try:
+                reply_messages(reply_token, [supplement_list_card(get_supplements(user_id))])
+            except requests.RequestException:
+                reply_text(reply_token, "目前無法讀取待補件資料，請稍後再試。")
+            continue
 
         # 查詢意圖優先於「代墊」關鍵字，絕不建立或修改登記暫存。
         if source.get("type") == "user" and user_id in INTERNAL_USER_IDS and looks_like_expense_query(text):
