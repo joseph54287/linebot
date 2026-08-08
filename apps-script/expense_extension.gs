@@ -3,6 +3,12 @@ const EXPENSE_SHEET_ID_ = '1cwpPt50hlC3OH2tOKQGA7DVv4-qwuMgrLir6AoyU7CM';
 const EXPENSE_SHEET_NAME_ = '表單回應 1';
 const COMPANY_TAX_ID_ = '90531465';
 
+function doGet(e) {
+  if (!authorized_(e)) return json_({ ok: false, error: 'unauthorized' });
+  if (String((e && e.parameter && e.parameter.action) || '') !== 'expense_stats') return doGetGroup_(e);
+  return expenseStats_(String(e.parameter.payer || '').trim());
+}
+
 function doPost(e) {
   if (!authorized_(e)) return json_({ ok: false, error: 'unauthorized' });
   const body = JSON.parse((e && e.postData && e.postData.contents) || '{}');
@@ -32,6 +38,25 @@ function saveExpense_(expense) {
   ]);
   const row = sheet.getLastRow();
   return json_({ ok: true, duplicate: false, row: row, receiptUrl: receiptUrl, recordUrl: expenseRecordUrl_(sheet, row) });
+}
+
+function expenseStats_(payer) {
+  if (!payer) return json_({ ok: false, error: 'payer_required' });
+  const sheet = SpreadsheetApp.openById(EXPENSE_SHEET_ID_).getSheetByName(EXPENSE_SHEET_NAME_);
+  if (!sheet) return json_({ ok: false, error: 'expense_sheet_not_found' });
+  const now = new Date();
+  const timezone = Session.getScriptTimeZone() || 'Asia/Taipei';
+  const period = Utilities.formatDate(now, timezone, 'yyyy-MM');
+  const rows = sheet.getLastRow() < 2 ? [] : sheet.getRange(2, 1, sheet.getLastRow() - 1, Math.max(18, sheet.getLastColumn())).getValues();
+  let count = 0, total = 0, pendingCount = 0, pendingTotal = 0, paidCount = 0, paidTotal = 0;
+  rows.forEach(function(row) {
+    if (String(row[6] || '').trim() !== payer || normalizeExpenseDate_(row[2]).slice(0, 7) !== period) return;
+    const amount = Number(String(row[5] || 0).replace(/,/g, '')) || 0;
+    count += 1; total += amount;
+    if (String(row[8] || '').trim() === '是') { paidCount += 1; paidTotal += amount; }
+    else { pendingCount += 1; pendingTotal += amount; }
+  });
+  return json_({ ok: true, period: period, count: count, total: total, pendingCount: pendingCount, pendingTotal: pendingTotal, paidCount: paidCount, paidTotal: paidTotal });
 }
 
 function findDuplicateExpense_(sheet, expense, transactionId, invoiceNumber) {

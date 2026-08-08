@@ -172,6 +172,19 @@ def test_clear_expense_intent_does_not_require_keyword():
     assert main.looks_like_expense_intent("公司明天要買硬碟") is False
 
 
+def test_expense_query_is_not_registration_intent():
+    for text in ["我想詢問自己的代墊情況", "查詢我的代墊", "我的代墊統計", "代墊進度"]:
+        assert main.looks_like_expense_query(text) is True
+    assert main.looks_like_expense_query("代墊 PJR 餐費 500") is False
+
+
+def test_expense_stats_card_shows_own_summary():
+    card = main.expense_stats_card({"period": "2026-08", "count": 3, "total": 1500, "pendingCount": 2, "pendingTotal": 1000, "paidCount": 1, "paidTotal": 500})
+    text = card["contents"]["body"]["contents"][0]["text"]
+    assert "登記：3 筆" in text
+    assert "待撥款：2 筆／$1000" in text
+
+
 def test_receipt_analysis_creates_one_expense_row():
     analysis = {
         "isReceipt": True,

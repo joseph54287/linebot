@@ -587,6 +587,40 @@ def looks_like_expense_intent(text: str) -> bool:
     return any(word in text for word in intent_words) and infer_amount(text) is not None
 
 
+def looks_like_expense_query(text: str) -> bool:
+    """辨識員工是在查詢自己的代墊，而不是新增一筆代墊。"""
+    folded = text.casefold()
+    if "代墊" not in folded:
+        return False
+    query_words = ["詢問", "查詢", "情況", "狀況", "統計", "紀錄", "記錄", "進度", "狀態", "多少", "我的"]
+    return any(word in folded for word in query_words)
+
+
+def get_expense_stats(user_id: str) -> dict[str, Any]:
+    """從共用支出表取得員工本月個人代墊統計。"""
+    if not EXPENSE_API_URL or not EXPENSE_API_KEY:
+        raise requests.RequestException("expense api is not configured")
+    payer = INTERNAL_USER_NAMES.get(user_id, "")
+    response = requests.get(EXPENSE_API_URL, params={"key": EXPENSE_API_KEY, "action": "expense_stats", "payer": payer}, timeout=20)
+    response.raise_for_status()
+    payload = response.json()
+    if not payload.get("ok"):
+        raise requests.RequestException("expense stats rejected")
+    return payload
+
+
+def expense_stats_card(stats: dict[str, Any]) -> dict[str, Any]:
+    """建立員工自己的本月代墊統計圖卡。"""
+    summary = "\n".join([
+        f"期間：{stats.get('period', '本月')}",
+        f"登記：{stats.get('count', 0)} 筆",
+        f"合計：${float(stats.get('total', 0)):g}",
+        f"待撥款：{stats.get('pendingCount', 0)} 筆／${float(stats.get('pendingTotal', 0)):g}",
+        f"已領款：{stats.get('paidCount', 0)} 筆／${float(stats.get('paidTotal', 0)):g}",
+    ])
+    return {"type": "flex", "altText": "我的代墊統計", "contents": {"type": "bubble", "header": {"type": "box", "layout": "vertical", "backgroundColor": "#17365D", "contents": [{"type": "text", "text": "我的代墊統計", "color": "#FFFFFF", "weight": "bold"}]}, "body": {"type": "box", "layout": "vertical", "contents": [{"type": "text", "text": summary, "wrap": True}]}}}
+
+
 def get_expense_session(user_id: str) -> dict[str, Any] | None:
     """取得未逾時的代墊登記暫存。"""
     session = EXPENSE_SESSIONS.get(user_id)
@@ -1351,6 +1385,15 @@ async def webhook(request: Request):
 
         text = message.get("text", "").strip()
         command = text.casefold()
+
+        # 查詢意圖優先於「代墊」關鍵字，絕不建立或修改登記暫存。
+        if source.get("type") == "user" and user_id in INTERNAL_USER_IDS and looks_like_expense_query(text):
+            try:
+                stats = get_expense_stats(user_id)
+                reply_messages(reply_token, [expense_stats_card(stats)])
+            except requests.RequestException:
+                reply_text(reply_token, "目前無法讀取代墊統計，請稍後再試；本次沒有建立代墊紀錄。")
+            continue
 
         # 圖片後直接輸入「代墊 PJR 專案」時，同時啟動 OCR 並累積本句資料。
         pending_receipt = get_expense_session(user_id) if source.get("type") == "user" else None
