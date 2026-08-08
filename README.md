@@ -29,6 +29,10 @@
 - `GROUP_REGISTRY_URL`
 - `GROUP_REGISTRY_API_KEY`
 - `EXPENSE_API_URL`（Google Apps Script 支出寫入端點）
+- `GEMINI_API_KEY`（收據影像辨識，只放 Render Secret）
+- `PROJECT_API_URL`、`PROJECT_API_KEY`（選填；近期未結案專案來源，未設定時使用手動輸入）
+
+員工確認送出後，Bot 會把 LINE 原始收據 Base64、檔名與交易識別碼交給 Apps Script；Apps Script 負責存入公司 Google Drive，並把附件連結與代墊資料寫入 Google Form 連動的回覆試算表。相同交易識別碼重試時應更新原紀錄，不重複建立附件或資料列。
 - `EXPENSE_API_KEY`
 - `GEMINI_API_KEY`（收據影像辨識）
 - `RECEIPT_VISION_MODEL`（預設 `gemini-3.6-flash`）

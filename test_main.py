@@ -117,16 +117,16 @@ def test_receipt_analysis_creates_one_expense_row():
     assert missing == ["專案名稱（沒有專案請寫「專案無」）"]
 
 
-def test_receipt_rejects_non_receipt_image():
+def test_receipt_rejects_clear_non_receipt_image():
     try:
         main.receipt_analysis_to_expense(
-            {"isReceipt": False},
+            {"isReceipt": False, "imageType": "人物風景照片"},
             "U6c6441cb38102499d1f80d4ea79a53ab",
             "image",
             "image/jpeg",
         )
     except ValueError as error:
-        assert "不像發票或收據" in str(error)
+        assert "不是可辨識的發票或收據" in str(error)
     else:
         raise AssertionError("非單據圖片必須被拒絕")
 
@@ -152,6 +152,89 @@ def test_receipt_does_not_guess_missing_total():
     assert data["amount"] is None
     assert "金額" in missing
     assert "影像辨識信心較低" in data["note"]
+
+
+def test_receipt_false_flag_is_accepted_when_fields_are_valid():
+    analysis = {
+        "isReceipt": False,
+        "imageType": "文件",
+        "merchantName": "測試商店",
+        "date": "2026-08-08",
+        "items": ["耗材"],
+        "totalAmount": 420,
+        "confidence": 0.6,
+    }
+    data, missing = main.receipt_analysis_to_expense(
+        analysis, "U9478b00702c716685d9d8b021d62d538", "image", "image/jpeg"
+    )
+    assert data["amount"] == 420
+    assert data["item"] == "耗材"
+    assert "專案名稱（沒有專案請寫「專案無」）" in missing
+
+
+def test_process_receipt_uses_second_pass_to_find_total(monkeypatch):
+    results = iter([
+        {"isReceipt": True, "merchantName": "測試店", "items": ["餐費"], "totalAmount": None},
+        {"isReceipt": True, "date": "2026-08-08", "totalAmount": 880, "confidence": 0.9},
+    ])
+
+    def fake_analyze(image_base64, mime_type, focused_retry=False):
+        return next(results)
+
+    monkeypatch.setattr(main, "analyze_receipt_image", fake_analyze)
+    data, _ = main.process_receipt_image(
+        "U6c6441cb38102499d1f80d4ea79a53ab", "image", "image/jpeg"
+    )
+    assert data["amount"] == 880
+    assert data["receiptSecondPass"] is True
+
+
+def test_recent_projects_filter_rank_and_limit():
+    projects = [
+        {"id": "old", "name": "舊專案", "status": "進行中", "updatedAt": "2026-01-01"},
+        {"id": "closed", "name": "PJR 已結案", "status": "已結案", "updatedAt": "2026-08-01"},
+        {"id": "pjr", "name": "PJR 廣告", "status": "進行中", "updatedAt": "2026-07-01", "aliases": ["吊車"]},
+        *[
+            {"id": str(index), "name": f"近期專案 {index}", "status": "執行中", "updatedAt": "2026-08-07"}
+            for index in range(12)
+        ],
+    ]
+    result = main.filter_recent_open_projects(projects, "PJR 吊車", main.datetime(2026, 8, 8))
+    assert len(result) == 10
+    assert result[0]["id"] == "pjr"
+    assert all(project["id"] not in {"old", "closed"} for project in result)
+
+
+def test_project_card_uses_short_index_postbacks():
+    card = main.project_candidate_card([{"id": "p1", "name": "很長的專案名稱測試"}])
+    buttons = card["contents"]["body"]["contents"]
+    assert buttons[0]["action"]["data"] == "expense:project:0"
+    assert buttons[-1]["action"]["data"] == "expense:project:manual"
+
+
+def test_submit_expense_adds_attachment_metadata(monkeypatch):
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"ok": True, "receiptUrl": "https://drive.google.com/test"}
+
+    captured = {}
+
+    def fake_post(url, params, json, timeout):
+        captured.update(json["expense"])
+        return FakeResponse()
+
+    monkeypatch.setattr(main, "EXPENSE_API_URL", "https://example.com/expense")
+    monkeypatch.setattr(main, "EXPENSE_API_KEY", "secret")
+    monkeypatch.setattr(main.requests, "post", fake_post)
+    main.submit_expense({
+        "date": "2026-08-08", "project": "PJR", "payer": "周暐", "amount": 500,
+        "receiptBase64": "image", "receiptMimeType": "image/jpeg",
+    })
+    assert captured["transactionId"]
+    assert captured["receiptFileName"].endswith(".jpg")
 
 
 def test_crane_expense_is_classified_as_project_expense():

@@ -5,9 +5,11 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import logging
 import os
 import re
 import time
+import uuid
 from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -24,6 +26,8 @@ EXPENSE_API_URL = os.environ.get("EXPENSE_API_URL", GROUP_REGISTRY_URL).rstrip("
 EXPENSE_API_KEY = os.environ.get("EXPENSE_API_KEY", GROUP_REGISTRY_API_KEY)
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 RECEIPT_VISION_MODEL = os.environ.get("RECEIPT_VISION_MODEL", "gemini-3.6-flash")
+PROJECT_API_URL = os.environ.get("PROJECT_API_URL", "").rstrip("/")
+PROJECT_API_KEY = os.environ.get("PROJECT_API_KEY", "")
 OWNER_USER_ID = os.environ.get(
     "OWNER_USER_ID",
     "U6c6441cb38102499d1f80d4ea79a53ab",
@@ -64,6 +68,13 @@ EXPENSE_PAYERS = [
 ]
 PAYMENT_SCHEDULES = ["立即支付", "月結(每月5號)", "已支出"]
 TAIPEI_TZ = ZoneInfo("Asia/Taipei")
+LOGGER = logging.getLogger("aurtor-line-bot")
+
+# 專案狀態會由不同系統提供，統一轉成小寫後排除已結束項目。
+CLOSED_PROJECT_STATUSES = {
+    "closed", "completed", "cancelled", "canceled", "archived",
+    "已結案", "結案", "已完成", "完成", "已取消", "取消", "封存", "已封存",
+}
 
 # 依 LINE User ID 自動帶入支出人，避免員工每次重複輸入姓名。
 INTERNAL_USER_NAMES = {
@@ -158,6 +169,50 @@ def option_card(title: str, options: list[str], field: str) -> dict[str, Any]:
                 "layout": "vertical",
                 "backgroundColor": "#17365D",
                 "contents": [{"type": "text", "text": title, "color": "#FFFFFF", "weight": "bold"}],
+            },
+            "body": {"type": "box", "layout": "vertical", "contents": buttons},
+        },
+    }
+
+
+def project_candidate_card(projects: list[dict[str, Any]]) -> dict[str, Any]:
+    """建立近期未結案專案圖卡；postback 只保存索引，避免長名稱超限。"""
+    buttons = [
+        {
+            "type": "button",
+            "style": "secondary",
+            "height": "sm",
+            "margin": "sm",
+            "action": {
+                "type": "postback",
+                "label": str(project["name"])[:20],
+                "data": f"expense:project:{index}",
+                "displayText": str(project["name"]),
+            },
+        }
+        for index, project in enumerate(projects)
+    ]
+    buttons.append({
+        "type": "button",
+        "height": "sm",
+        "margin": "sm",
+        "action": {
+            "type": "postback",
+            "label": "其他／自行輸入",
+            "data": "expense:project:manual",
+            "displayText": "自行輸入專案名稱",
+        },
+    })
+    return {
+        "type": "flex",
+        "altText": "請選擇近期未結案專案",
+        "contents": {
+            "type": "bubble",
+            "header": {
+                "type": "box",
+                "layout": "vertical",
+                "backgroundColor": "#17365D",
+                "contents": [{"type": "text", "text": "選擇專案", "color": "#FFFFFF", "weight": "bold"}],
             },
             "body": {"type": "box", "layout": "vertical", "contents": buttons},
         },
@@ -358,6 +413,96 @@ def get_expense_session(user_id: str) -> dict[str, Any] | None:
     return session
 
 
+def _project_updated_at(project: dict[str, Any]) -> datetime | None:
+    """解析專案系統常見的 ISO 日期格式。"""
+    raw = str(project.get("updatedAt") or project.get("createdAt") or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return parsed.replace(tzinfo=None)
+    except ValueError:
+        return None
+
+
+def filter_recent_open_projects(
+    projects: list[dict[str, Any]],
+    context: str = "",
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """篩選最近 90 天未結案專案，並依內容相關性與更新時間排序。"""
+    current = (now or datetime.now(TAIPEI_TZ)).replace(tzinfo=None)
+    cutoff = current - timedelta(days=90)
+    keywords = {token.casefold() for token in re.findall(r"[A-Za-z0-9\u4e00-\u9fff]+", context) if len(token) >= 2}
+    candidates: list[tuple[int, datetime, dict[str, Any]]] = []
+    for raw_project in projects:
+        if not isinstance(raw_project, dict):
+            continue
+        name = str(raw_project.get("name") or raw_project.get("projectName") or "").strip()
+        if not name:
+            continue
+        status = str(raw_project.get("status") or "").strip().casefold()
+        if status in CLOSED_PROJECT_STATUSES:
+            continue
+        updated_at = _project_updated_at(raw_project)
+        if updated_at and updated_at < cutoff:
+            continue
+        aliases = raw_project.get("aliases") if isinstance(raw_project.get("aliases"), list) else []
+        searchable = " ".join([name, *map(str, aliases)]).casefold()
+        relevance = sum(1 for keyword in keywords if keyword in searchable)
+        candidates.append((relevance, updated_at or datetime.min, {
+            "id": str(raw_project.get("id") or raw_project.get("projectId") or name),
+            "name": name,
+            "status": str(raw_project.get("status") or ""),
+            "updatedAt": updated_at.isoformat() if updated_at else "",
+            "aliases": aliases,
+        }))
+    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [project for _, _, project in candidates[:10]]
+
+
+def get_recent_open_projects(context: str = "") -> list[dict[str, Any]]:
+    """向未來專案系統取得候選；未設定或失敗時由呼叫端改用手動輸入。"""
+    if not PROJECT_API_URL:
+        return []
+    headers = {"Accept": "application/json"}
+    if PROJECT_API_KEY:
+        headers["Authorization"] = f"Bearer {PROJECT_API_KEY}"
+    response = requests.get(PROJECT_API_URL, headers=headers, timeout=5)
+    response.raise_for_status()
+    payload = response.json()
+    if isinstance(payload, list):
+        projects = payload
+    elif isinstance(payload, dict):
+        projects = payload.get("projects") or payload.get("data") or []
+    else:
+        projects = []
+    if not isinstance(projects, list):
+        raise requests.RequestException("project api returned invalid data")
+    return filter_recent_open_projects(projects, context)
+
+
+def build_project_or_missing_prompt(session: dict[str, Any], missing: list[str]) -> dict[str, Any]:
+    """專案缺漏時優先提供近期選項；API 無法使用則回到一次性文字補充。"""
+    project_label = "專案名稱（沒有專案請寫「專案無」）"
+    if project_label not in missing:
+        return build_missing_prompt(missing)
+    context = " ".join([
+        str(session.get("raw_text") or ""),
+        str(session.get("data", {}).get("item") or ""),
+        str(session.get("data", {}).get("note") or ""),
+    ])
+    try:
+        projects = get_recent_open_projects(context)
+    except (requests.RequestException, ValueError, TypeError):
+        projects = []
+    if not projects:
+        return build_missing_prompt(missing)
+    session["project_candidates"] = projects
+    LOGGER.info("expense project candidates count=%s", len(projects))
+    return project_candidate_card(projects)
+
+
 def next_prompt(session: dict[str, Any]) -> dict[str, Any]:
     """依目前步驟產生下一個問題。"""
     step = session["step"]
@@ -445,17 +590,21 @@ def parse_json_object(text: str) -> dict[str, Any]:
     return payload
 
 
-def analyze_receipt_image(image_base64: str, mime_type: str) -> dict[str, Any]:
-    """使用 Gemini 讀取台灣發票或收據並回傳固定欄位。"""
+def analyze_receipt_image(image_base64: str, mime_type: str, focused_retry: bool = False) -> dict[str, Any]:
+    """使用 Gemini 讀取台灣發票或收據；必要時執行聚焦總額的第二輪。"""
     if not GEMINI_API_KEY:
         raise requests.RequestException("receipt vision is not configured")
-    prompt = """你是台灣公司支出單據辨識器。只輸出 JSON，不要 Markdown。
-辨識這張圖片是否為發票或收據，並輸出：
+    prompt = """你是台灣公司支出單據 OCR 欄位擷取器。只輸出 JSON，不要 Markdown。
+不要因為照片角度、皺摺、手寫、裁切或版型陌生就拒絕，請先盡力擷取可見欄位。輸出：
 documentType, merchantName, date(YYYY-MM-DD或空字串), items(字串陣列),
 totalAmount(數字或null), invoiceNumber, taxId, hasBusinessTaxId(布林值),
-currency(預設TWD), confidence(0到1), warnings(字串陣列), isReceipt(布林值)。
+currency(預設TWD), confidence(0到1), warnings(字串陣列), isReceipt(布林值), imageType(簡短字串)。
 totalAmount 必須是整張單據的應付或實付總額，不可使用統編、發票號碼、日期或交易序號。
 看不清楚就留空並在 warnings 說明，不要猜測。"""
+    if focused_retry:
+        prompt += """
+這是第二輪校對。請像 OCR 人員逐行查看「總計、合計、應付、實付、現金、信用卡、TOTAL」附近數字，
+優先找出唯一的最終付款總額與消費日期；若有多個候選，選擇具有總額標籤且位置最接近付款區的數字。"""
     response = requests.post(
         f"https://generativelanguage.googleapis.com/v1beta/models/{RECEIPT_VISION_MODEL}:generateContent",
         params={"key": GEMINI_API_KEY},
@@ -480,6 +629,49 @@ totalAmount 必須是整張單據的應付或實付總額，不可使用統編�
         raise requests.RequestException("receipt vision returned invalid JSON") from error
 
 
+def valid_receipt_amount(analysis: dict[str, Any]) -> float | None:
+    """只接受合理且大於零的單據總額。"""
+    raw_amount = analysis.get("totalAmount")
+    try:
+        amount = float(str(raw_amount).replace(",", ""))
+        return amount if 0 < amount <= 100_000_000 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def receipt_signal_count(analysis: dict[str, Any]) -> int:
+    """計算日期、商家與品項三種輔助訊號。"""
+    items = analysis.get("items") if isinstance(analysis.get("items"), list) else []
+    return sum([
+        bool(str(analysis.get("date") or "").strip()),
+        bool(str(analysis.get("merchantName") or "").strip()),
+        any(str(item).strip() for item in items),
+    ])
+
+
+def merge_receipt_analyses(primary: dict[str, Any], retry: dict[str, Any]) -> dict[str, Any]:
+    """以第一輪為主，使用第二輪補足空白欄位及更可信的總額。"""
+    merged = dict(primary)
+    for field in ["documentType", "merchantName", "date", "items", "totalAmount", "invoiceNumber", "taxId", "currency", "imageType"]:
+        current_value = merged.get(field)
+        if current_value is None or current_value == "" or (field == "items" and not current_value):
+            merged[field] = retry.get(field)
+    if valid_receipt_amount(primary) is None and valid_receipt_amount(retry) is not None:
+        merged["totalAmount"] = retry["totalAmount"]
+    merged["hasBusinessTaxId"] = bool(primary.get("hasBusinessTaxId") or retry.get("hasBusinessTaxId"))
+    merged["isReceipt"] = bool(primary.get("isReceipt") or retry.get("isReceipt"))
+    merged["confidence"] = max(float(primary.get("confidence") or 0), float(retry.get("confidence") or 0))
+    warnings = []
+    primary_warnings = primary.get("warnings") if isinstance(primary.get("warnings"), list) else []
+    retry_warnings = retry.get("warnings") if isinstance(retry.get("warnings"), list) else []
+    for warning in [*primary_warnings, *retry_warnings]:
+        if str(warning) not in warnings:
+            warnings.append(str(warning))
+    merged["warnings"] = warnings
+    merged["usedSecondPass"] = True
+    return merged
+
+
 def receipt_analysis_to_expense(
     analysis: dict[str, Any],
     user_id: str,
@@ -487,16 +679,14 @@ def receipt_analysis_to_expense(
     mime_type: str,
 ) -> tuple[dict[str, Any], list[str]]:
     """驗證影像辨識結果並轉成既有 Google Sheet 支出欄位。"""
-    if not analysis.get("isReceipt"):
-        raise ValueError("圖片不像發票或收據，請重新拍攝清楚的完整單據。")
-
-    raw_amount = analysis.get("totalAmount")
-    try:
-        amount = float(str(raw_amount).replace(",", ""))
-        if amount <= 0:
-            raise ValueError
-    except (TypeError, ValueError):
-        amount = None
+    amount = valid_receipt_amount(analysis)
+    signals = receipt_signal_count(analysis)
+    image_type = str(analysis.get("imageType") or analysis.get("documentType") or "").casefold()
+    obvious_non_documents = ["人物", "人像", "風景", "聊天", "對話", "自拍", "person", "landscape", "chat", "screenshot"]
+    if amount is None and signals == 0 and (
+        analysis.get("isReceipt") is False or any(label in image_type for label in obvious_non_documents)
+    ):
+        raise ValueError("圖片不是可辨識的發票或收據，請重新拍攝完整單據。")
 
     raw_date = str(analysis.get("date") or "").strip()
     try:
@@ -536,7 +726,19 @@ def receipt_analysis_to_expense(
         "receiptMimeType": mime_type,
         "receiptDocumentType": str(analysis.get("documentType") or "單據"),
         "receiptConfidence": confidence,
+        "receiptSecondPass": bool(analysis.get("usedSecondPass")),
     }
+    if amount is None:
+        data["note"] = (data["note"] + "；無法辨識總額，請補充金額或重新拍攝").strip("；")
+    LOGGER.info(
+        "receipt vision type=%s has_amount=%s has_date=%s item_count=%s confidence=%.2f second_pass=%s",
+        str(analysis.get("documentType") or analysis.get("imageType") or "unknown")[:30],
+        amount is not None,
+        bool(expense_date),
+        len(items),
+        confidence,
+        bool(analysis.get("usedSecondPass")),
+    )
     missing = missing_expense_fields(data)
     return data, missing
 
@@ -544,6 +746,9 @@ def receipt_analysis_to_expense(
 def process_receipt_image(user_id: str, image_base64: str, mime_type: str) -> tuple[dict[str, Any], list[str]]:
     """完成收據辨識與欄位轉換，供 Webhook 與測試共用。"""
     analysis = analyze_receipt_image(image_base64, mime_type)
+    if valid_receipt_amount(analysis) is None or receipt_signal_count(analysis) == 0:
+        retry = analyze_receipt_image(image_base64, mime_type, focused_retry=True)
+        analysis = merge_receipt_analyses(analysis, retry)
     return receipt_analysis_to_expense(analysis, user_id, image_base64, mime_type)
 
 
@@ -551,6 +756,15 @@ def submit_expense(data: dict[str, Any]) -> dict[str, Any]:
     """交由 Google Apps Script 上傳收據並新增支出資料。"""
     if not EXPENSE_API_URL or not EXPENSE_API_KEY:
         raise requests.RequestException("expense api is not configured")
+    # 同一暫存重試時沿用交易識別碼，讓 Apps Script 避免建立重複附件或資料列。
+    data.setdefault("transactionId", uuid.uuid4().hex)
+    if data.get("receiptBase64"):
+        extension = "png" if data.get("receiptMimeType") == "image/png" else "jpg"
+        safe_project = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff_-]+", "-", str(data.get("project") or "未指定"))[:40]
+        data.setdefault(
+            "receiptFileName",
+            f"{data.get('date') or datetime.now(TAIPEI_TZ).date().isoformat()}_{data.get('payer') or '員工'}_{safe_project}_{data.get('amount') or '待補'}.{extension}",
+        )
     response = requests.post(EXPENSE_API_URL, params={"key": EXPENSE_API_KEY}, json={"action": "expense", "expense": data}, timeout=30)
     response.raise_for_status()
     payload = response.json()
@@ -679,6 +893,23 @@ async def webhook(request: Request):
             parts = raw_data.split(":", 2)
             action = parts[1]
             value = parts[2] if len(parts) > 2 else ""
+            if action == "project":
+                if value == "manual":
+                    session["step"] = "project_manual"
+                    reply_text(reply_token, "請直接輸入專案名稱；沒有專案請輸入「專案無」。")
+                    continue
+                try:
+                    project = session.get("project_candidates", [])[int(value)]
+                except (ValueError, IndexError, TypeError):
+                    reply_text(reply_token, "專案選項已失效，請直接輸入專案名稱。")
+                    session["step"] = "project_manual"
+                    continue
+                session["data"]["project"] = str(project["name"])
+                session.pop("project_candidates", None)
+                missing = missing_expense_fields(session["data"])
+                session["step"] = "quick_missing" if missing else "quick_confirm"
+                reply_messages(reply_token, [build_missing_prompt(missing) if missing else build_expense_confirmation(session["data"])])
+                continue
             if action == "date":
                 value = postback.get("params", {}).get("date", value)
                 try:
@@ -761,7 +992,7 @@ async def webhook(request: Request):
                     "raw_text": "",
                     "data": data,
                 }
-                reply_messages(reply_token, [build_missing_prompt(missing) if missing else build_expense_confirmation(data)])
+                reply_messages(reply_token, [build_project_or_missing_prompt(EXPENSE_SESSIONS[user_id], missing) if missing else build_expense_confirmation(data)])
                 continue
 
             # 員工先上傳圖片時先保留，等收到「代墊」才傳送至辨識服務。
@@ -823,7 +1054,7 @@ async def webhook(request: Request):
                     "raw_text": "",
                     "data": data,
                 }
-                reply_messages(reply_token, [build_missing_prompt(missing) if missing else build_expense_confirmation(data)])
+                reply_messages(reply_token, [build_project_or_missing_prompt(EXPENSE_SESSIONS[user_id], missing) if missing else build_expense_confirmation(data)])
             else:
                 EXPENSE_SESSIONS[user_id] = {
                     "step": "receipt_waiting_image",
@@ -863,15 +1094,20 @@ async def webhook(request: Request):
             }
             EXPENSE_SESSIONS[user_id] = session
             if missing:
-                reply_messages(reply_token, [build_missing_prompt(missing)])
+                reply_messages(reply_token, [build_project_or_missing_prompt(session, missing)])
             else:
                 reply_messages(reply_token, [build_expense_confirmation(data)])
             continue
 
         if session:
             step = session["step"]
-            if step == "project":
+            if step in {"project", "project_manual"}:
                 session["data"]["project"] = text
+                if step == "project_manual":
+                    missing = missing_expense_fields(session["data"])
+                    session["step"] = "quick_missing" if missing else "quick_confirm"
+                    reply_messages(reply_token, [build_missing_prompt(missing) if missing else build_expense_confirmation(session["data"])])
+                    continue
                 session["step"] = "item"
             elif step == "item":
                 session["data"]["item"] = text
