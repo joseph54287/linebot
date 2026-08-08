@@ -8,6 +8,7 @@
 - 三位使用者共用同一組 Webhook
 - 收到 `My ID` 時，回覆該傳送者自己的 LINE User ID
 - 內部員工在個人聊天室以一句口語描述代墊內容，Bot 自動解析完整性並用一張圖卡確認
+- 高爾賢個人聊天室的報價方案、草稿修改與明確送出事件會轉交報價後端
 
 代墊範例：
 
@@ -36,6 +37,7 @@
 - `EXPENSE_API_KEY`
 - `GEMINI_API_KEY`（收據影像辨識）
 - `RECEIPT_VISION_MODEL`（預設 `gemini-3.6-flash`）
+- `QUOTE_WEBHOOK_URL`（報價後端 Webhook，預設 `https://linebot-bam2.onrender.com/webhook`）
 
 ## Webhook
 

@@ -24,6 +24,8 @@ services:
         sync: false
       - key: RECEIPT_VISION_MODEL
         value: gemini-3.6-flash
+      - key: QUOTE_WEBHOOK_URL
+        value: https://linebot-bam2.onrender.com/webhook
       - key: OWNER_USER_ID
         value: U6c6441cb38102499d1f80d4ea79a53ab
       - key: INTERNAL_USER_IDS
