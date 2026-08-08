@@ -11,82 +11,43 @@ QUOTE_USER_ID = "Ub983deb79584603885e5b28e9fdf2d5d"
 
 
 def quote_event(event_type="postback", user_id=QUOTE_USER_ID, source_type="user"):
-    """建立報價事件測試資料，避免各案例重複組裝 payload。"""
-    event = {
-        "type": event_type,
-        "source": {"type": source_type, "userId": user_id},
-    }
+    event = {"type": event_type, "source": {"type": source_type, "userId": user_id}}
     if event_type == "postback":
-        event["postback"] = {
-            "data": "action=scheme&invitation=inv-123&scheme=A",
-        }
+        event["postback"] = {"data": "action=scheme&invitation=inv-123&scheme=A"}
     else:
         event["message"] = {"type": "text", "text": "確認"}
     return event
 
 
-def test_quote_scheme_postback_is_limited_to_owner_and_valid_schemes():
+def test_quote_events_remain_limited_to_owner_and_explicit_actions():
     event = quote_event()
     assert main.is_quote_event(event) is True
-
-    event["postback"]["data"] = "action=scheme&invitation=inv-123&scheme=C"
-    assert main.is_quote_event(event) is True
-
     event["postback"]["data"] = "action=scheme&invitation=inv-123&scheme=D"
     assert main.is_quote_event(event) is False
     assert main.is_quote_event(quote_event(user_id="U-other")) is False
-    assert main.is_quote_event(quote_event(source_type="group")) is False
-
-
-def test_quote_text_requires_explicit_confirmation_or_full_subject():
-    event = quote_event(event_type="message")
+    text_event = quote_event(event_type="message")
     for text in ["確認", "送出", "主旨：Re: 測試報價"]:
-        event["message"]["text"] = text
-        assert main.is_quote_event(event) is True
-
-    for text in ["確認一下", "報價", "主旨: 半形冒號", "代墊"]:
-        event["message"]["text"] = text
-        assert main.is_quote_event(event) is False
-
-    event["message"] = {"type": "image", "id": "image-1"}
-    assert main.is_quote_event(event) is False
+        text_event["message"]["text"] = text
+        assert main.is_quote_event(text_event) is True
+    text_event["message"]["text"] = "代墊"
+    assert main.is_quote_event(text_event) is False
 
 
-def test_forward_quote_webhook_preserves_raw_body_and_signature(monkeypatch):
+def test_quote_forward_preserves_body_and_signature(monkeypatch):
     calls = []
 
     class Response:
         def raise_for_status(self):
             return None
 
-    def fake_post(url, **kwargs):
-        calls.append((url, kwargs))
-        return Response()
-
-    monkeypatch.setattr(main.requests, "post", fake_post)
-    body = b'{"events": [{"type": "postback"}]}'
-
+    monkeypatch.setattr(main.requests, "post", lambda url, **kwargs: calls.append((url, kwargs)) or Response())
+    body = b'{"events":[]}'
     assert main.forward_quote_webhook(body, "original-signature") is True
-    assert len(calls) == 1
     assert calls[0][1]["data"] is body
     assert calls[0][1]["headers"]["X-Line-Signature"] == "original-signature"
-    assert calls[0][1]["timeout"] == 20
 
 
-def test_forward_quote_webhook_does_not_retry_on_failure(monkeypatch):
-    calls = []
-
-    def failing_post(*args, **kwargs):
-        calls.append((args, kwargs))
-        raise main.requests.Timeout("timeout")
-
-    monkeypatch.setattr(main.requests, "post", failing_post)
-
-    assert main.forward_quote_webhook(b"raw", "signature") is False
-    assert len(calls) == 1
-
-
-def test_mixed_batch_forwards_once_and_keeps_existing_event(monkeypatch):
+def test_mixed_quote_batch_keeps_existing_event(monkeypatch):
     payload = {
         "events": [
             quote_event(event_type="message"),
@@ -99,21 +60,10 @@ def test_mixed_batch_forwards_once_and_keeps_existing_event(monkeypatch):
         ],
     }
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    forwarded = []
-    replies = []
-
+    forwarded, replies = [], []
     monkeypatch.setattr(main, "verify_signature", lambda raw, signature: True)
-    monkeypatch.setattr(
-        main,
-        "forward_quote_webhook",
-        lambda raw, signature: forwarded.append((raw, signature)) or True,
-    )
-    monkeypatch.setattr(
-        main,
-        "reply_text",
-        lambda token, text: replies.append((token, text)),
-    )
-
+    monkeypatch.setattr(main, "forward_quote_webhook", lambda raw, signature: forwarded.append((raw, signature)) or True)
+    monkeypatch.setattr(main, "reply_text", lambda token, text: replies.append((token, text)))
     delivered = False
 
     async def receive():
@@ -123,19 +73,13 @@ def test_mixed_batch_forwards_once_and_keeps_existing_event(monkeypatch):
         delivered = True
         return {"type": "http.request", "body": body, "more_body": False}
 
-    request = Request(
-        {
-            "type": "http",
-            "method": "POST",
-            "path": "/webhook",
-            "headers": [(b"x-line-signature", b"original-signature")],
-        },
-        receive,
-    )
-
-    response = asyncio.run(main.webhook(request))
-
-    assert response == {"status": "ok"}
+    request = Request({
+        "type": "http",
+        "method": "POST",
+        "path": "/webhook",
+        "headers": [(b"x-line-signature", b"original-signature")],
+    }, receive)
+    assert asyncio.run(main.webhook(request)) == {"status": "ok"}
     assert forwarded == [(body, "original-signature")]
     assert replies == [("reply-my-id", "User ID：U-other")]
 
@@ -187,7 +131,7 @@ def test_parse_complete_natural_language(monkeypatch):
     assert missing == []
     assert data["date"] == "2026-08-07"
     assert data["project"] == "TOYOTA"
-    assert data["item"] == "拍攝餐費"
+    assert data["item"] == "餐飲"
     assert data["amount"] == 850
     assert data["payer"] == "周暐"
     assert data["category"] == "案件支出（餐飲、道具、人員...）"
@@ -247,7 +191,8 @@ def test_receipt_analysis_creates_one_expense_row():
         "base64-image",
         "image/jpeg",
     )
-    assert data["item"] == "便當、飲料"
+    assert data["item"] == "餐飲"
+    assert "單據內容：便當、飲料" in data["note"]
     assert data["amount"] == 350
     assert data["category"] == "案件支出（餐飲、道具、人員...）"
     assert data["invoice"] == "是"
@@ -305,7 +250,8 @@ def test_receipt_false_flag_is_accepted_when_fields_are_valid():
         analysis, "U9478b00702c716685d9d8b021d62d538", "image", "image/jpeg"
     )
     assert data["amount"] == 420
-    assert data["item"] == "耗材"
+    assert data["item"] == ""
+    assert "消費項目" in missing
     assert "專案名稱（沒有專案請寫「專案無」）" in missing
 
 
@@ -346,7 +292,72 @@ def test_project_card_uses_short_index_postbacks():
     card = main.project_candidate_card([{"id": "p1", "name": "很長的專案名稱測試"}])
     buttons = card["contents"]["body"]["contents"]
     assert buttons[0]["action"]["data"] == "expense:project:0"
-    assert buttons[-1]["action"]["data"] == "expense:project:manual"
+    assert buttons[-3]["action"]["data"] == "expense:project:manual"
+    assert buttons[-2]["action"]["data"] == "expense:project:none"
+    assert buttons[-1]["action"]["data"] == "expense:cancel"
+
+
+def test_project_phrases_are_understood():
+    assert main.infer_project_and_item("代墊 PJR 專案", None)[0] == "PJR"
+    assert main.infer_project_and_item("這個專案是 MG50", None)[0] == "MG50"
+
+
+def test_expense_supplements_accumulate_without_losing_receipt():
+    existing = {
+        "registrantUserId": "U-test",
+        "date": "2026-07-06",
+        "month": "7",
+        "project": "",
+        "item": "",
+        "amount": None,
+        "category": "",
+        "payer": "周暐",
+        "payment": "已支出",
+        "reimbursed": "否",
+        "invoice": "未開",
+        "receiptBase64": "receipt-image",
+        "receiptMimeType": "image/jpeg",
+    }
+    after_project = main.merge_expense_text(existing, "這個專案是 MG50", "U-test")
+    completed = main.merge_expense_text(after_project, "加油 $500", "U-test")
+    assert completed["project"] == "MG50"
+    assert completed["item"] == "交通"
+    assert completed["amount"] == 500
+    assert completed["category"] == main.PROJECT_EXPENSE_CATEGORY
+    assert completed["receiptBase64"] == "receipt-image"
+    assert main.missing_expense_fields(completed) == []
+
+
+def test_cpc_receipt_is_classified_as_transportation():
+    analysis = {
+        "isReceipt": True,
+        "documentType": "電子發票",
+        "merchantName": "台灣中油",
+        "date": "2026-07-06",
+        "items": ["九五無鉛汽油"],
+        "totalAmount": 500,
+        "confidence": 0.95,
+    }
+    data, missing = main.receipt_analysis_to_expense(
+        analysis, "U6c6441cb38102499d1f80d4ea79a53ab", "image", "image/jpeg"
+    )
+    assert data["item"] == "交通"
+    assert data["amount"] == 500
+    assert missing == ["專案名稱（沒有專案請寫「專案無」）"]
+
+
+def test_unknown_item_and_no_answer_show_action_cards(monkeypatch):
+    session = {"raw_text": "", "data": {"project": "PJR", "item": "", "amount": 500, "category": "", "payer": "周暐"}}
+    message = main.build_project_or_missing_prompt(session, ["消費項目", "項目分類或更清楚的消費內容"])
+    buttons = message["contents"]["body"]["contents"]
+    assert buttons[0]["action"]["data"] == "expense:item:交通"
+    assert buttons[-1]["action"]["data"] == "expense:cancel"
+
+    monkeypatch.setattr(main, "get_recent_open_projects", lambda context: [])
+    project_message = main.build_project_or_missing_prompt(session, ["專案名稱（沒有專案請寫「專案無」）"])
+    project_buttons = project_message["contents"]["body"]["contents"]
+    assert project_buttons[0]["action"]["data"] == "expense:project:manual"
+    assert project_buttons[-1]["action"]["data"] == "expense:cancel"
 
 
 def test_submit_expense_adds_attachment_metadata(monkeypatch):

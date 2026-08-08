@@ -53,7 +53,6 @@ INTERNAL_USER_IDS = {
 }
 
 app = FastAPI(title="AURTOR LINE Bot")
-logger = logging.getLogger(__name__)
 
 # Render 只暫存尚未送出的對話；完成、取消或逾時後立即清除。
 EXPENSE_SESSIONS: dict[str, dict[str, Any]] = {}
@@ -74,6 +73,9 @@ EXPENSE_PAYERS = [
     "Well", "小歐", "Jeffrey", "Marshall",
 ]
 PAYMENT_SCHEDULES = ["立即支付", "月結(每月5號)", "已支出"]
+EXPENSE_ITEM_OPTIONS = [
+    "交通", "餐飲", "道具", "場景", "器材", "演員", "服裝", "其他工作人員", "後期",
+]
 TAIPEI_TZ = ZoneInfo("Asia/Taipei")
 LOGGER = logging.getLogger("aurtor-line-bot")
 
@@ -93,7 +95,8 @@ INTERNAL_USER_NAMES = {
 CATEGORY_KEYWORDS = {
     "案件支出（餐飲、道具、人員...）": [
         "餐", "便當", "飲料", "道具", "演員", "人員", "車馬", "住宿", "場地", "器材費",
-        "吊車", "起重", "吊掛", "機具租賃", "高空車", "堆高機",
+        "吊車", "起重", "吊掛", "機具租賃", "高空車", "堆高機", "加油", "汽油", "柴油",
+        "油資", "燃料", "中油", "台塑", "服裝", "造型", "後期", "剪輯", "調光", "混音",
     ],
     "例行性支出(水電費/房租)": ["水費", "電費", "房租", "瓦斯", "網路費"],
     "人事費用(商業保險費,薪資 ,勞保,健保,勞退）": ["薪資", "勞保", "健保", "勞退", "保險"],
@@ -103,6 +106,20 @@ CATEGORY_KEYWORDS = {
     "業務開發": ["業務", "招待", "提案", "拜訪"],
     "行銷費用": ["廣告投放", "行銷", "社群", "宣傳"],
 }
+
+# 員工只需要理解製作現場的大項目；Google Form 的既有分類由系統同步帶入。
+ITEM_KEYWORDS = {
+    "交通": ["交通", "加油", "汽油", "柴油", "油資", "燃料", "中油", "台塑", "停車", "計程車", "高鐵", "火車", "租車"],
+    "餐飲": ["餐飲", "餐費", "便當", "飲料", "咖啡", "早餐", "午餐", "晚餐", "點心"],
+    "道具": ["道具", "美術材料", "佈置用品"],
+    "場景": ["場景", "場地", "棚租", "攝影棚", "租棚"],
+    "器材": ["器材", "鏡頭", "燈具", "相機", "硬碟", "電池", "線材", "吊車", "高空車", "堆高機"],
+    "演員": ["演員", "臨演", "模特兒", "model"],
+    "服裝": ["服裝", "治裝", "造型", "妝髮"],
+    "其他工作人員": ["工作人員", "攝影師", "燈光師", "收音師", "場務", "製片", "助理"],
+    "後期": ["後期", "剪輯", "調光", "混音", "動畫", "字幕", "特效"],
+}
+PROJECT_EXPENSE_CATEGORY = "案件支出（餐飲、道具、人員...）"
 
 FIELD_LABELS = {
     "project": ["專案", "案件"],
@@ -114,10 +131,7 @@ FIELD_LABELS = {
 def is_quote_event(event: dict[str, Any]) -> bool:
     """只辨識高爾賢個人聊天室內明確定義的報價操作。"""
     source = event.get("source", {})
-    if (
-        source.get("type") != "user"
-        or source.get("userId") != QUOTE_OWNER_USER_ID
-    ):
+    if source.get("type") != "user" or source.get("userId") != QUOTE_OWNER_USER_ID:
         return False
 
     if event.get("type") == "postback":
@@ -135,7 +149,6 @@ def is_quote_event(event: dict[str, Any]) -> bool:
             return False
         text = message.get("text", "").strip()
         return text in {"確認", "送出"} or text.startswith("主旨：")
-
     return False
 
 
@@ -145,17 +158,13 @@ def forward_quote_webhook(body: bytes, signature: str) -> bool:
         response = requests.post(
             QUOTE_WEBHOOK_URL,
             data=body,
-            headers={
-                "Content-Type": "application/json",
-                "X-Line-Signature": signature,
-            },
+            headers={"Content-Type": "application/json", "X-Line-Signature": signature},
             timeout=20,
         )
         response.raise_for_status()
         return True
     except requests.RequestException as error:
-        # 不記錄原始內容、簽章或文案，避免敏感資料進入 Render log。
-        logger.error("報價 Webhook 轉送失敗：%s", type(error).__name__)
+        LOGGER.error("報價 Webhook 轉送失敗：%s", type(error).__name__)
         return False
 
 
@@ -245,31 +254,71 @@ def project_candidate_card(projects: list[dict[str, Any]]) -> dict[str, Any]:
                 "displayText": str(project["name"]),
             },
         }
-        for index, project in enumerate(projects)
+        for index, project in enumerate(projects[:7])
     ]
-    buttons.append({
+    buttons.extend([{
         "type": "button",
+        "style": "primary",
         "height": "sm",
         "margin": "sm",
         "action": {
             "type": "postback",
-            "label": "其他／自行輸入",
+            "label": "填寫專案名稱",
             "data": "expense:project:manual",
-            "displayText": "自行輸入專案名稱",
+            "displayText": "填寫專案名稱",
         },
-    })
+    }, {
+        "type": "button",
+        "height": "sm",
+        "margin": "sm",
+        "action": {"type": "postback", "label": "無專案", "data": "expense:project:none", "displayText": "無專案"},
+    }, {
+        "type": "button",
+        "height": "sm",
+        "margin": "sm",
+        "action": {"type": "postback", "label": "取消登記", "data": "expense:cancel", "displayText": "取消登記"},
+    }])
     return {
         "type": "flex",
-        "altText": "請選擇近期未結案專案",
+        "altText": "還差專案名稱",
         "contents": {
             "type": "bubble",
             "header": {
                 "type": "box",
                 "layout": "vertical",
                 "backgroundColor": "#17365D",
-                "contents": [{"type": "text", "text": "選擇專案", "color": "#FFFFFF", "weight": "bold"}],
+                "contents": [{"type": "text", "text": "還差專案名稱", "color": "#FFFFFF", "weight": "bold"}],
             },
             "body": {"type": "box", "layout": "vertical", "contents": buttons},
+        },
+    }
+
+
+def item_option_card() -> dict[str, Any]:
+    """顯示九個製作項目與取消按鈕，避免員工自行猜分類名稱。"""
+    message = option_card("請選擇消費項目", EXPENSE_ITEM_OPTIONS, "item")
+    message["contents"]["body"]["contents"].append({
+        "type": "button",
+        "height": "sm",
+        "margin": "sm",
+        "action": {"type": "postback", "label": "取消登記", "data": "expense:cancel", "displayText": "取消登記"},
+    })
+    return message
+
+
+def amount_missing_card() -> dict[str, Any]:
+    """金額無法辨識時提供明確完成方式與取消選項。"""
+    return {
+        "type": "template",
+        "altText": "請補充支出金額",
+        "template": {
+            "type": "buttons",
+            "title": "還差支出金額",
+            "text": "請直接輸入金額，例如：500",
+            "actions": [
+                {"type": "postback", "label": "重新辨識收據", "data": "expense:retake", "displayText": "重新辨識收據"},
+                {"type": "postback", "label": "取消登記", "data": "expense:cancel", "displayText": "取消登記"},
+            ],
         },
     }
 
@@ -345,6 +394,17 @@ def infer_category(text: str) -> str:
     return best if scores[best] > 0 else ""
 
 
+def infer_item_option(text: str) -> str:
+    """把收據或口語內容對應到員工可理解的九個製作項目。"""
+    folded = text.casefold()
+    scores = {
+        item: sum(1 for keyword in keywords if keyword.casefold() in folded)
+        for item, keywords in ITEM_KEYWORDS.items()
+    }
+    best = max(scores, key=scores.get)
+    return best if scores[best] > 0 else ""
+
+
 def infer_payer(text: str, user_id: str) -> str:
     """優先採用文字指定的付款人，否則使用訊息傳送者。"""
     aliases = {
@@ -386,6 +446,14 @@ def infer_project_and_item(text: str, amount: int | float | None) -> tuple[str, 
     """從明確標籤或常見口語結構辨識專案與消費項目。"""
     project = extract_labeled_value(text, FIELD_LABELS["project"])
     item = extract_labeled_value(text, FIELD_LABELS["item"])
+    # 同時支援「PJR 專案」與「這個專案是 MG50」等自然說法。
+    project_suffix = re.search(r"(?:^|[，,、；;\s])([A-Za-z0-9][A-Za-z0-9_-]{1,39})\s*(?:專案|案件)(?:$|[，,、；;\s])", text, re.IGNORECASE)
+    project_sentence = re.search(r"(?:這個|本次|這筆)?\s*(?:專案|案件)\s*(?:是|為|改成|改為|叫)?\s*[：:]?\s*([A-Za-z0-9][A-Za-z0-9_-]{1,39})", text, re.IGNORECASE)
+    if project_sentence:
+        project = project_sentence.group(1)
+    elif project_suffix:
+        project = project_suffix.group(1)
+    project = re.sub(r"^(?:是|為|改成|改為|叫)\s*", "", project).strip()
     cleaned = re.sub(r"^(?:我要|我想)?\s*(?:登記)?\s*代墊\s*", "", text, flags=re.IGNORECASE)
     cleaned = re.sub(r"(?:今天|昨天|昨日|前天|明天)", "", cleaned)
     cleaned = re.sub(r"20\d{2}[年/\-.]\d{1,2}[月/\-.]\d{1,2}日?", "", cleaned)
@@ -411,7 +479,8 @@ def infer_project_and_item(text: str, amount: int | float | None) -> tuple[str, 
 def parse_expense_text(text: str, user_id: str) -> tuple[dict[str, Any], list[str]]:
     """將員工的一句話轉為支出欄位，並一次回傳所有缺漏。"""
     amount = infer_amount(text)
-    project, item = infer_project_and_item(text, amount)
+    project, raw_item = infer_project_and_item(text, amount)
+    item = infer_item_option(" ".join([raw_item, text]))
     expense_date = parse_expense_date(text)
     data: dict[str, Any] = {
         "registrantUserId": user_id,
@@ -420,7 +489,7 @@ def parse_expense_text(text: str, user_id: str) -> tuple[dict[str, Any], list[st
         "project": project,
         "item": item,
         "amount": amount,
-        "category": infer_category(item or text),
+        "category": infer_category(" ".join([raw_item, text])) or (PROJECT_EXPENSE_CATEGORY if item else ""),
         "payer": infer_payer(text, user_id),
         "payment": "已支出",
         "reimbursed": "是" if re.search(r"已領(?:到)?款", text) else "否",
@@ -428,6 +497,37 @@ def parse_expense_text(text: str, user_id: str) -> tuple[dict[str, Any], list[st
         "note": "未附收據" if re.search(r"沒收據|無收據", text) else "無",
     }
     return data, missing_expense_fields(data)
+
+
+def merge_expense_text(existing: dict[str, Any], text: str, user_id: str) -> dict[str, Any]:
+    """只更新本句能明確辨識的欄位，避免補一句話就清空收據或舊資料。"""
+    parsed, _ = parse_expense_text(text, user_id)
+    if not existing:
+        return parsed
+    merged = dict(existing)
+
+    for field in ["project", "item", "amount", "category"]:
+        if parsed.get(field) not in {None, ""}:
+            merged[field] = parsed[field]
+
+    if re.search(r"今天|昨天|昨日|前天|明天|20\d{2}[年/\-.]|\d{1,2}[月/\-.]\d{1,2}", text):
+        merged["date"] = parsed["date"]
+        merged["month"] = parsed["month"]
+    if any(name.casefold() in text.casefold() for name in ["周暐", "周偉", "高爾賢", "Alex", "阿全", "筌", "公司付", "公司未付"]):
+        merged["payer"] = parsed["payer"]
+    if re.search(r"已領(?:到)?款|未領款|尚未領款", text):
+        merged["reimbursed"] = parsed["reimbursed"]
+    if re.search(r"有統編|含統編|統編發票|無統編|未開", text):
+        merged["invoice"] = parsed["invoice"]
+    if re.search(r"沒收據|無收據", text):
+        merged["note"] = "未附收據"
+
+    merged.setdefault("registrantUserId", user_id)
+    merged.setdefault("payer", INTERNAL_USER_NAMES.get(user_id, ""))
+    merged.setdefault("payment", "已支出")
+    merged.setdefault("reimbursed", "否")
+    merged.setdefault("invoice", "未開")
+    return merged
 
 
 def missing_expense_fields(data: dict[str, Any]) -> list[str]:
@@ -538,37 +638,39 @@ def get_recent_open_projects(context: str = "") -> list[dict[str, Any]]:
 
 
 def build_project_or_missing_prompt(session: dict[str, Any], missing: list[str]) -> dict[str, Any]:
-    """專案缺漏時優先提供近期選項；API 無法使用則回到一次性文字補充。"""
+    """依缺漏欄位顯示可直接完成或取消的操作圖卡。"""
     project_label = "專案名稱（沒有專案請寫「專案無」）"
-    if project_label not in missing:
-        return build_missing_prompt(missing)
-    context = " ".join([
-        str(session.get("raw_text") or ""),
-        str(session.get("data", {}).get("item") or ""),
-        str(session.get("data", {}).get("note") or ""),
-    ])
-    try:
-        projects = get_recent_open_projects(context)
-    except (requests.RequestException, ValueError, TypeError):
-        projects = []
-    if not projects:
-        return build_missing_prompt(missing)
-    session["project_candidates"] = projects
-    LOGGER.info("expense project candidates count=%s", len(projects))
-    return project_candidate_card(projects)
+    if project_label in missing:
+        context = " ".join([
+            str(session.get("raw_text") or ""),
+            str(session.get("data", {}).get("item") or ""),
+            str(session.get("data", {}).get("note") or ""),
+        ])
+        try:
+            projects = get_recent_open_projects(context)
+        except (requests.RequestException, ValueError, TypeError):
+            projects = []
+        session["project_candidates"] = projects[:7]
+        LOGGER.info("expense project candidates count=%s", len(projects[:7]))
+        return project_candidate_card(projects[:7])
+    if "消費項目" in missing or "項目分類或更清楚的消費內容" in missing:
+        return item_option_card()
+    if "金額" in missing:
+        return amount_missing_card()
+    return build_missing_prompt(missing)
 
 
 def next_prompt(session: dict[str, Any]) -> dict[str, Any]:
     """依目前步驟產生下一個問題。"""
     step = session["step"]
     if step == "project":
-        return {"type": "text", "text": "請輸入專案名稱；沒有專案請輸入「無」。"}
+        return project_candidate_card([])
     if step == "item":
-        return {"type": "text", "text": "請輸入消費項目，例如：拍攝餐費、硬碟、停車費。"}
+        return item_option_card()
     if step == "amount":
         return {"type": "text", "text": "請輸入支出金額，只輸入數字即可。"}
     if step == "category":
-        return option_card("請選擇項目分類", EXPENSE_CATEGORIES, "category")
+        return item_option_card()
     if step == "payer":
         return option_card("請選擇支出人", EXPENSE_PAYERS, "payer")
     if step == "payment":
@@ -658,7 +760,8 @@ totalAmount 必須是整張單據的應付或實付總額，不可使用統編�
 看不清楚就留空並在 warnings 說明，不要猜測。"""
     if focused_retry:
         prompt += """
-這是第二輪校對。請像 OCR 人員逐行查看「總計、合計、應付、實付、現金、信用卡、TOTAL」附近數字，
+這是第二輪校對。圖片中的單據可能只佔一小部分，請先定位紙張、發票或收據區域，忽略桌面、電腦及其他背景，
+再像 OCR 人員逐行查看「總計、合計、應付、實付、現金、信用卡、TOTAL」附近數字，
 優先找出唯一的最終付款總額與消費日期；若有多個候選，選擇具有總額標籤且位置最接近付款區的數字。"""
     response = requests.post(
         f"https://generativelanguage.googleapis.com/v1beta/models/{RECEIPT_VISION_MODEL}:generateContent",
@@ -752,13 +855,19 @@ def receipt_analysis_to_expense(
     items = analysis.get("items") if isinstance(analysis.get("items"), list) else []
     items = [str(item).strip() for item in items if str(item).strip()]
     merchant = str(analysis.get("merchantName") or "").strip()
-    item = "、".join(items[:8]) or merchant
-    category = infer_category(item)
+    item_detail = "、".join(items[:8]) or merchant
+    item = infer_item_option(" ".join([merchant, item_detail]))
+    category = infer_category(" ".join([merchant, item_detail])) or (PROJECT_EXPENSE_CATEGORY if item else "")
     invoice_number = str(analysis.get("invoiceNumber") or "").strip()
     tax_id = str(analysis.get("taxId") or "").strip()
     warnings = analysis.get("warnings") if isinstance(analysis.get("warnings"), list) else []
     confidence = float(analysis.get("confidence") or 0)
-    note_parts = [part for part in [f"商家：{merchant}" if merchant else "", f"發票號碼：{invoice_number}" if invoice_number else "", f"統編：{tax_id}" if tax_id else ""] if part]
+    note_parts = [part for part in [
+        f"商家：{merchant}" if merchant else "",
+        f"單據內容：{item_detail}" if item_detail and item_detail != merchant else "",
+        f"發票號碼：{invoice_number}" if invoice_number else "",
+        f"統編：{tax_id}" if tax_id else "",
+    ] if part]
     if confidence < 0.75:
         note_parts.append("影像辨識信心較低，已要求人工確認")
     if warnings:
@@ -801,7 +910,11 @@ def receipt_analysis_to_expense(
 def process_receipt_image(user_id: str, image_base64: str, mime_type: str) -> tuple[dict[str, Any], list[str]]:
     """完成收據辨識與欄位轉換，供 Webhook 與測試共用。"""
     analysis = analyze_receipt_image(image_base64, mime_type)
-    if valid_receipt_amount(analysis) is None or receipt_signal_count(analysis) == 0:
+    receipt_context = " ".join([
+        str(analysis.get("merchantName") or ""),
+        " ".join(map(str, analysis.get("items") or [])) if isinstance(analysis.get("items"), list) else "",
+    ])
+    if valid_receipt_amount(analysis) is None or receipt_signal_count(analysis) < 2 or not infer_item_option(receipt_context):
         retry = analyze_receipt_image(image_base64, mime_type, focused_retry=True)
         analysis = merge_receipt_analyses(analysis, retry)
     return receipt_analysis_to_expense(analysis, user_id, image_base64, mime_type)
@@ -960,6 +1073,13 @@ async def webhook(request: Request):
                     session["step"] = "project_manual"
                     reply_text(reply_token, "請直接輸入專案名稱；沒有專案請輸入「專案無」。")
                     continue
+                if value == "none":
+                    session["data"]["project"] = "專案無"
+                    session.pop("project_candidates", None)
+                    missing = missing_expense_fields(session["data"])
+                    session["step"] = "quick_missing" if missing else "quick_confirm"
+                    reply_messages(reply_token, [build_project_or_missing_prompt(session, missing) if missing else build_expense_confirmation(session["data"])])
+                    continue
                 try:
                     project = session.get("project_candidates", [])[int(value)]
                 except (ValueError, IndexError, TypeError):
@@ -970,7 +1090,14 @@ async def webhook(request: Request):
                 session.pop("project_candidates", None)
                 missing = missing_expense_fields(session["data"])
                 session["step"] = "quick_missing" if missing else "quick_confirm"
-                reply_messages(reply_token, [build_missing_prompt(missing) if missing else build_expense_confirmation(session["data"])])
+                reply_messages(reply_token, [build_project_or_missing_prompt(session, missing) if missing else build_expense_confirmation(session["data"])])
+                continue
+            if action == "item" and value in EXPENSE_ITEM_OPTIONS:
+                session["data"]["item"] = value
+                session["data"]["category"] = PROJECT_EXPENSE_CATEGORY
+                missing = missing_expense_fields(session["data"])
+                session["step"] = "quick_missing" if missing else "quick_confirm"
+                reply_messages(reply_token, [build_project_or_missing_prompt(session, missing) if missing else build_expense_confirmation(session["data"])])
                 continue
             if action == "date":
                 value = postback.get("params", {}).get("date", value)
@@ -1088,6 +1215,37 @@ async def webhook(request: Request):
         text = message.get("text", "").strip()
         command = text.casefold()
 
+        # 圖片後直接輸入「代墊 PJR 專案」時，同時啟動 OCR 並累積本句資料。
+        pending_receipt = get_expense_session(user_id) if source.get("type") == "user" else None
+        if command.startswith("代墊") and command != "代墊" and pending_receipt and pending_receipt.get("step") == "receipt_waiting_trigger":
+            if user_id not in INTERNAL_USER_IDS:
+                reply_text(reply_token, "你的帳號尚未加入公司內部登記名單。")
+                continue
+            try:
+                data, _ = process_receipt_image(
+                    user_id,
+                    pending_receipt["receiptBase64"],
+                    pending_receipt["receiptMimeType"],
+                )
+                data = merge_expense_text(data, text, user_id)
+            except ValueError as error:
+                EXPENSE_SESSIONS.pop(user_id, None)
+                reply_text(reply_token, str(error))
+                continue
+            except requests.RequestException:
+                reply_text(reply_token, "目前無法辨識收據，圖片已保留，請稍後再輸入「代墊」重試。")
+                continue
+            missing = missing_expense_fields(data)
+            session = {
+                "step": "quick_missing" if missing else "quick_confirm",
+                "updated_at": time.time(),
+                "raw_text": text,
+                "data": data,
+            }
+            EXPENSE_SESSIONS[user_id] = session
+            reply_messages(reply_token, [build_project_or_missing_prompt(session, missing) if missing else build_expense_confirmation(data)])
+            continue
+
         if command == "代墊":
             if source.get("type") != "user":
                 reply_text(reply_token, "代墊登記請在 Bot 個人聊天室使用。")
@@ -1139,14 +1297,7 @@ async def webhook(request: Request):
         if is_quick_expense:
             previous_text = session.get("raw_text", "") if session else ""
             combined_text = f"{previous_text}，{text}".strip("，")
-            data, missing = parse_expense_text(combined_text, user_id)
-
-            # 修改或補充時保留先前已確認的欄位，只覆蓋本次能明確解析的內容。
-            if session and session.get("data"):
-                previous_data = session["data"]
-                for field, value in previous_data.items():
-                    if field not in data or data.get(field) in {None, ""}:
-                        data[field] = value
+            data = merge_expense_text(session.get("data", {}) if session else {}, text, user_id)
             missing = missing_expense_fields(data)
             session = {
                 "step": "quick_missing" if missing else "quick_confirm",
@@ -1164,17 +1315,25 @@ async def webhook(request: Request):
         if session:
             step = session["step"]
             if step in {"project", "project_manual"}:
-                session["data"]["project"] = text
+                session["data"]["project"] = "專案無" if text in {"無", "沒有", "無專案", "專案無"} else text
                 if step == "project_manual":
                     missing = missing_expense_fields(session["data"])
                     session["step"] = "quick_missing" if missing else "quick_confirm"
-                    reply_messages(reply_token, [build_missing_prompt(missing) if missing else build_expense_confirmation(session["data"])])
+                    reply_messages(reply_token, [build_project_or_missing_prompt(session, missing) if missing else build_expense_confirmation(session["data"])])
                     continue
                 session["step"] = "item"
             elif step == "item":
-                session["data"]["item"] = text
+                item = infer_item_option(text)
+                if not item:
+                    reply_messages(reply_token, [item_option_card()])
+                    continue
+                session["data"]["item"] = item
+                session["data"]["category"] = PROJECT_EXPENSE_CATEGORY
                 session["step"] = "amount"
             elif step == "amount":
+                if text in {"無", "沒有", "不知道"}:
+                    reply_messages(reply_token, [amount_missing_card()])
+                    continue
                 normalized = text.replace(",", "").replace("$", "")
                 try:
                     amount = float(normalized)

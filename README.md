@@ -32,12 +32,14 @@
 - `EXPENSE_API_URL`（Google Apps Script 支出寫入端點）
 - `GEMINI_API_KEY`（收據影像辨識，只放 Render Secret）
 - `PROJECT_API_URL`、`PROJECT_API_KEY`（選填；近期未結案專案來源，未設定時使用手動輸入）
+- `QUOTE_WEBHOOK_URL`（報價後端 Webhook，預設 `https://linebot-bam2.onrender.com/webhook`）
 
 員工確認送出後，Bot 會把 LINE 原始收據 Base64、檔名與交易識別碼交給 Apps Script；Apps Script 負責存入公司 Google Drive，並把附件連結與代墊資料寫入 Google Form 連動的回覆試算表。相同交易識別碼重試時應更新原紀錄，不重複建立附件或資料列。
+
+代墊流程會累積員工每次補充的欄位，不會清空既有收據。消費項目固定為交通、餐飲、道具、場景、器材、演員、服裝、其他工作人員及後期；無法自動判定時以 LINE 圖卡讓員工點選。缺少專案、項目或金額時均提供完成方式與取消按鈕。
 - `EXPENSE_API_KEY`
 - `GEMINI_API_KEY`（收據影像辨識）
 - `RECEIPT_VISION_MODEL`（預設 `gemini-3.6-flash`）
-- `QUOTE_WEBHOOK_URL`（報價後端 Webhook，預設 `https://linebot-bam2.onrender.com/webhook`）
 
 ## Webhook
 
