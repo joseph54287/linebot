@@ -439,17 +439,12 @@ def test_recent_project_is_kept_for_twenty_four_hours(monkeypatch):
     assert main.get_recent_expense_project("U-recent") == ""
 
 
-def test_resume_project_phrases_are_recognized():
-    assert main.looks_like_resume_expense("我想繼續上一個專案") is True
-    assert main.looks_like_resume_expense("繼續這個專案") is True
-    assert main.looks_like_resume_expense("查詢我的代墊") is False
-
-
 def test_batch_summary_has_record_link_and_resume_button():
     card = main.expense_batch_summary_card({"count": 2, "total": 900, "notes": ["第 1 筆未填寫公司統編"], "recordUrls": ["https://example.com/row"]})
     actions = card["template"]["actions"]
     assert actions[0]["label"] == "查看本批紀錄"
-    assert actions[1]["data"] == "expense:resume_recent"
+    assert actions[1]["data"] == "expense:start_new"
+    assert actions[2]["data"] == "expense:finish_summary"
 
 
 def test_project_card_paginates_with_absolute_indexes():

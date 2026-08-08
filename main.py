@@ -655,12 +655,6 @@ def get_recent_expense_project(user_id: str) -> str:
     return str(record.get("project") or "")
 
 
-def looks_like_resume_expense(text: str) -> bool:
-    """辨識繼續上一個／同一個專案的自然說法。"""
-    folded = re.sub(r"\s+", "", text.casefold())
-    return "繼續" in folded and any(word in folded for word in ["上一個專案", "這個專案", "同一個專案", "剛剛的專案", "代墊"])
-
-
 def _project_updated_at(project: dict[str, Any]) -> datetime | None:
     """解析專案系統常見的 ISO 日期格式。"""
     raw = str(project.get("updatedAt") or project.get("createdAt") or "").strip()
@@ -739,6 +733,9 @@ def build_project_or_missing_prompt(session: dict[str, Any], missing: list[str])
             projects = get_recent_open_projects(context)
         except (requests.RequestException, ValueError, TypeError):
             projects = []
+        recent_project = str(session.get("recent_project") or "").strip()
+        if recent_project and all(str(project.get("name") or "") != recent_project for project in projects):
+            projects.insert(0, {"id": f"recent:{recent_project}", "name": recent_project, "status": "最近使用", "updatedAt": "", "aliases": []})
         session["project_candidates"] = projects
         LOGGER.info("expense project candidates count=%s", len(projects))
         return project_candidate_card(projects)
@@ -840,7 +837,8 @@ def expense_batch_summary_card(batch: dict[str, Any]) -> dict[str, Any]:
     record_urls = batch.get("recordUrls", [])
     if record_urls and str(record_urls[-1]).startswith("https://"):
         actions.append({"type": "uri", "label": "查看本批紀錄", "uri": record_urls[-1]})
-    actions.append({"type": "postback", "label": "繼續上一個專案", "data": "expense:resume_recent", "displayText": "繼續上一個專案"})
+    actions.append({"type": "postback", "label": "開始新的代墊", "data": "expense:start_new", "displayText": "開始新的代墊"})
+    actions.append({"type": "postback", "label": "完成", "data": "expense:finish_summary", "displayText": "完成"})
     return {"type": "template", "altText": "連續代墊摘要", "template": {"type": "buttons", "title": "本次代墊摘要", "text": f"共登記：{batch.get('count', 0)} 筆\n合計：${float(batch.get('total', 0)):g}\n特別備註：{note_text}"[:160], "actions": actions}}
 
 
@@ -1208,14 +1206,16 @@ async def webhook(request: Request):
                 EXPENSE_SESSIONS[user_id] = {"step": "receipt_waiting_image", "updated_at": time.time(), "data": {"registrantUserId": user_id, "project": project}}
                 reply_text(reply_token, f"請上傳下一張收據。{'目前沿用專案：' + project if project else ''}")
                 continue
-            if raw_data == "expense:resume_recent":
-                project = get_recent_expense_project(user_id)
-                if not project:
-                    reply_text(reply_token, "最近 24 小時沒有可沿用的專案，請先輸入「代墊」開始新登記。")
-                    continue
-                EXPENSE_BATCHES[user_id] = {"project": project, "count": 0, "total": 0.0, "notes": [], "hashes": [], "recordUrls": [], "updated_at": time.time()}
-                EXPENSE_SESSIONS[user_id] = {"step": "receipt_waiting_image", "updated_at": time.time(), "data": {"registrantUserId": user_id, "project": project}}
-                reply_text(reply_token, f"已恢復專案「{project}」。請直接上傳下一張收據，不需要填寫消費項目。")
+            if raw_data == "expense:start_new":
+                recent_project = get_recent_expense_project(user_id)
+                EXPENSE_BATCHES.pop(user_id, None)
+                EXPENSE_SESSIONS[user_id] = {"step": "receipt_waiting_image", "updated_at": time.time(), "recent_project": recent_project, "data": {"registrantUserId": user_id}}
+                reply_text(reply_token, "已開始全新的代墊批次。請上傳第一張收據，完成辨識後再確認專案。")
+                continue
+            if raw_data == "expense:finish_summary":
+                EXPENSE_BATCHES.pop(user_id, None)
+                EXPENSE_SESSIONS.pop(user_id, None)
+                reply_text(reply_token, "本次代墊已完成。")
                 continue
             if raw_data == "expense:end_batch":
                 batch = EXPENSE_BATCHES.pop(user_id, None)
@@ -1395,6 +1395,7 @@ async def webhook(request: Request):
                     "updated_at": time.time(),
                     "raw_text": "",
                     "data": data,
+                    "recent_project": session.get("recent_project", ""),
                 }
                 reply_messages(reply_token, [build_project_or_missing_prompt(EXPENSE_SESSIONS[user_id], missing) if missing else build_expense_confirmation(data)])
                 continue
@@ -1429,16 +1430,6 @@ async def webhook(request: Request):
 
         text = message.get("text", "").strip()
         command = text.casefold()
-
-        if source.get("type") == "user" and user_id in INTERNAL_USER_IDS and looks_like_resume_expense(text):
-            project = get_recent_expense_project(user_id)
-            if not project:
-                reply_text(reply_token, "最近 24 小時沒有可沿用的專案，請先輸入「代墊」開始新登記。")
-                continue
-            EXPENSE_BATCHES[user_id] = {"project": project, "count": 0, "total": 0.0, "notes": [], "hashes": [], "recordUrls": [], "updated_at": time.time()}
-            EXPENSE_SESSIONS[user_id] = {"step": "receipt_waiting_image", "updated_at": time.time(), "data": {"registrantUserId": user_id, "project": project}}
-            reply_text(reply_token, f"已恢復專案「{project}」。請直接上傳下一張收據，不需要填寫消費項目。")
-            continue
 
         # 查詢意圖優先於「代墊」關鍵字，絕不建立或修改登記暫存。
         if source.get("type") == "user" and user_id in INTERNAL_USER_IDS and looks_like_expense_query(text):
