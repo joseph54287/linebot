@@ -54,6 +54,8 @@ OWNER_USER_ID = os.environ.get(
     "OWNER_USER_ID",
     "U6c6441cb38102499d1f80d4ea79a53ab",
 )
+# 外案最終核准人固定為高爾賢的 LINE 帳號；避免其他系統的 OWNER_USER_ID 誤導核准通知。
+EXTERNAL_CASE_OWNER_USER_ID = os.environ.get("EXTERNAL_CASE_OWNER_USER_ID", QUOTE_OWNER_USER_ID)
 DEFAULT_INTERNAL_USER_IDS = (
     "U6c6441cb38102499d1f80d4ea79a53ab,"
     "Ub983deb79584603885e5b28e9fdf2d5d,"
@@ -1684,15 +1686,23 @@ async def webhook(request: Request):
                         continue
                     try:
                         external_case.api_call(BONUS_API_URL, BONUS_API_KEY, {"action": "submit", "data": session["data"]})
-                        push_messages(OWNER_USER_ID, [external_case.approval_card(session["data"])])
                     except requests.RequestException:
                         reply_text(reply_token, "目前無法送出核准，內容還在，請稍後再按一次。")
                         continue
+                    notification_sent = True
+                    try:
+                        push_messages(EXTERNAL_CASE_OWNER_USER_ID, [external_case.approval_card(session["data"])])
+                    except requests.RequestException:
+                        notification_sent = False
+                        LOGGER.error("外案已寫入，但主管核准通知推送失敗 request_id=%s", session["data"].get("requestId"))
                     external_case.SESSIONS.pop(user_id, None)
-                    reply_text(reply_token, "已送出，現在是「待核准」。\n有結果我會通知你。")
+                    message = "已送出，現在是「待核准」。\n有結果我會通知你。"
+                    if not notification_sent:
+                        message += "\n主管通知暫時未送達，但資料已安全保存，不需要重複送出。"
+                    reply_text(reply_token, message)
                     continue
                 if action in {"approve", "reject"} and len(parts) >= 3:
-                    if user_id != OWNER_USER_ID:
+                    if user_id != EXTERNAL_CASE_OWNER_USER_ID:
                         reply_text(reply_token, "這個操作只有核准人可以執行。")
                         continue
                     request_id = parts[2]

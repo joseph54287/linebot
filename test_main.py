@@ -128,6 +128,10 @@ from starlette.requests import Request
 QUOTE_USER_ID = "Ub983deb79584603885e5b28e9fdf2d5d"
 
 
+def test_external_case_approval_owner_is_kao_er_hsien():
+    assert main.EXTERNAL_CASE_OWNER_USER_ID == QUOTE_USER_ID
+
+
 def test_external_case_natural_message_and_tax_are_available_from_main_service():
     assert main.external_case is external_case
     data = external_case.parse_initial("8 月 10 號外案 3 萬", "U-test", "爾賢")
@@ -212,6 +216,36 @@ def test_external_case_full_webhook_returns_visible_flex_confirmation(monkeypatc
     card = replies[-1][1][0]
     assert card["type"] == "flex"
     assert card["contents"]["footer"]["contents"][0]["action"]["data"] == "external:submit"
+
+
+def test_external_case_submit_is_reported_saved_even_if_owner_push_fails(monkeypatch):
+    user_id = "U6c6441cb38102499d1f80d4ea79a53ab"
+    data = external_case.parse_initial("8月10號外案8萬", user_id, "周暐")
+    data.update({"projectName": "BWS", "caseType": "導演案", "destination": "公司", "paymentDate": "2026-09-15", "contact": "王小姐"})
+    external_case.SESSIONS[user_id] = {"data": data, "step": "confirm", "updatedAt": main.time.time()}
+    replies = []
+    monkeypatch.setattr(main, "verify_signature", lambda raw, signature: True)
+    monkeypatch.setattr(external_case, "api_call", lambda *args, **kwargs: {"ok": True})
+    monkeypatch.setattr(main, "push_messages", lambda *args, **kwargs: (_ for _ in ()).throw(main.requests.RequestException("push failed")))
+    monkeypatch.setattr(main, "reply_text", lambda token, text: replies.append(text))
+    payload = {"events": [{
+        "type": "postback", "replyToken": "reply-submit", "source": {"type": "user", "userId": user_id},
+        "postback": {"data": "external:submit"},
+    }]}
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    delivered = False
+
+    async def receive():
+        nonlocal delivered
+        if delivered:
+            return {"type": "http.disconnect"}
+        delivered = True
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    request = Request({"type": "http", "method": "POST", "path": "/webhook", "headers": [(b"x-line-signature", b"test")]}, receive)
+    assert asyncio.run(main.webhook(request)) == {"status": "ok"}
+    assert "資料已安全保存" in replies[-1]
+    assert external_case.get_session(user_id) is None
 
 
 def all_actions(value):
