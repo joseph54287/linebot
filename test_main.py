@@ -91,6 +91,13 @@ def test_external_case_natural_message_and_tax_are_available_from_main_service()
     assert external_case.next_step(data) == "details"
 
 
+def test_external_case_ten_wan_never_reprompts_for_amount():
+    for text in ["8 月 10 號外案 10 萬", "8月10號外案 100,000 元", "８月１０號外案１０萬", "8月10號外案十萬"]:
+        data = external_case.parse_initial(text, "U-test", "爾賢")
+        assert data["amount"] == 100000
+        assert external_case.next_step(data) == "details"
+
+
 def all_actions(value):
     """遞迴收集 Flex 圖卡操作，避免測試綁死視覺排版位置。"""
     found = []

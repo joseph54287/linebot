@@ -20,7 +20,8 @@ import requests
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-APP_RELEASE = "2026-08-09-expense-v14"
+APP_RELEASE = "2026-08-09-expense-v15"
+import external_case
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 GROUP_REGISTRY_URL = os.environ.get("GROUP_REGISTRY_URL", "").rstrip("/")
@@ -28,9 +29,11 @@ GROUP_REGISTRY_API_KEY = os.environ.get("GROUP_REGISTRY_API_KEY", "")
 EXPENSE_API_URL = os.environ.get("EXPENSE_API_URL", GROUP_REGISTRY_URL).rstrip("/")
 EXPENSE_API_KEY = os.environ.get("EXPENSE_API_KEY", GROUP_REGISTRY_API_KEY)
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-RECEIPT_VISION_MODEL = os.environ.get("RECEIPT_VISION_MODEL", "gemini-2.5-flash")
+RECEIPT_VISION_MODEL = os.environ.get("RECEIPT_VISION_MODEL", "gemini-3.6-flash")
 PROJECT_API_URL = os.environ.get("PROJECT_API_URL", "").rstrip("/")
 PROJECT_API_KEY = os.environ.get("PROJECT_API_KEY", "")
+BONUS_API_URL = os.environ.get("BONUS_API_URL", "").rstrip("/")
+BONUS_API_KEY = os.environ.get("BONUS_API_KEY", "")
 QUOTE_WEBHOOK_URL = os.environ.get(
     "QUOTE_WEBHOOK_URL",
     "https://linebot-bam2.onrender.com/webhook",
@@ -115,6 +118,12 @@ INTERNAL_USER_NAMES = {
     "U6c6441cb38102499d1f80d4ea79a53ab": "周暐",
     "Ub983deb79584603885e5b28e9fdf2d5d": "高爾賢",
     "U9478b00702c716685d9d8b021d62d538": "阿全",
+}
+# 獎金表使用的正式姓名必須與 COUNTIF 關鍵字完全一致。
+EXTERNAL_CASE_NAMES = {
+    "U6c6441cb38102499d1f80d4ea79a53ab": "周暐",
+    "Ub983deb79584603885e5b28e9fdf2d5d": "爾賢",
+    "U9478b00702c716685d9d8b021d62d538": "阿筌",
 }
 
 CATEGORY_KEYWORDS = {
@@ -445,6 +454,12 @@ def start_loading(user_id: str, seconds: int = 60) -> None:
         response.raise_for_status()
     except requests.RequestException:
         LOGGER.warning("無法顯示 LINE 載入動畫")
+
+
+def external_next_message(session: dict[str, Any]) -> dict[str, Any]:
+    if session["step"] == "confirm":
+        return external_case.confirmation_card(session["data"])
+    return external_case.prompt(session["step"])
 
 
 def ui_header(title: str, eyebrow: str = "") -> dict[str, Any]:
@@ -1590,6 +1605,61 @@ async def webhook(request: Request):
         CURRENT_LINE_SOURCE_TYPE.set(str(source.get("type") or ""))
         CURRENT_WEBHOOK_EVENT_ID.set(event_id)
 
+        # 外案申請獨立於代墊流程：主管核准成功後才寫入獎金表。
+        if event.get("type") == "postback" and source.get("type") == "user":
+            raw_external = event.get("postback", {}).get("data", "")
+            if raw_external.startswith("external:"):
+                parts = raw_external.split(":", 3)
+                action = parts[1] if len(parts) > 1 else ""
+                if action == "cancel":
+                    external_case.SESSIONS.pop(user_id, None)
+                    reply_text(reply_token, "好，這筆外案先不送出。")
+                    continue
+                if action == "set" and len(parts) == 4:
+                    session = external_case.accept_option(user_id, parts[2], parts[3])
+                    if not session:
+                        reply_text(reply_token, "這筆外案已逾時，請重新輸入「外案」。")
+                    else:
+                        reply_messages(reply_token, [external_next_message(session)])
+                    continue
+                if action == "submit":
+                    session = external_case.get_session(user_id)
+                    if not session or session["step"] != "confirm":
+                        reply_text(reply_token, "資料還沒完整，請重新輸入「外案」。")
+                        continue
+                    try:
+                        external_case.api_call(BONUS_API_URL, BONUS_API_KEY, {"action": "submit", "data": session["data"]})
+                        push_messages(OWNER_USER_ID, [external_case.approval_card(session["data"])])
+                    except requests.RequestException:
+                        reply_text(reply_token, "目前無法送出核准，內容還在，請稍後再按一次。")
+                        continue
+                    external_case.SESSIONS.pop(user_id, None)
+                    reply_text(reply_token, "已送出，現在是「待核准」。\n有結果我會通知你。")
+                    continue
+                if action in {"approve", "reject"} and len(parts) >= 3:
+                    if user_id != OWNER_USER_ID:
+                        reply_text(reply_token, "這個操作只有核准人可以執行。")
+                        continue
+                    request_id = parts[2]
+                    try:
+                        result = external_case.api_call(BONUS_API_URL, BONUS_API_KEY, {
+                            "action": action, "requestId": request_id, "approverUserId": user_id,
+                        })
+                    except requests.RequestException:
+                        reply_text(reply_token, "目前無法完成處理，這筆尚未登記，請稍後再試。")
+                        continue
+                    applicant_id = str(result.get("employeeUserId") or "")
+                    project_name = str(result.get("projectName") or "這筆外案")
+                    if action == "approve":
+                        reply_text(reply_token, "已核准，並完成登記。")
+                        if applicant_id:
+                            push_messages(applicant_id, [{"type": "text", "text": f"你的外案「{project_name}」已經核准，並完成登記。"}])
+                    else:
+                        reply_text(reply_token, "已拒絕這筆外案。")
+                        if applicant_id:
+                            push_messages(applicant_id, [{"type": "text", "text": f"你的外案「{project_name}」沒有通過。"}])
+                    continue
+
         # 代墊登記只允許已登記成員在 Bot 個人聊天室操作。
         if event.get("type") == "postback" and source.get("type") == "user":
             if user_id not in INTERNAL_USER_IDS:
@@ -1867,11 +1937,9 @@ async def webhook(request: Request):
                     EXPENSE_SESSIONS[user_id] = {"step": "receipt_processing", "updated_at": time.time(), "pending_text": "", "data": {"registrantUserId": user_id, "project": batch.get("project", "")}}
                     data, missing = process_receipt_image(user_id, receipt_base64, receipt_mime)
                 except ValueError:
-                    EXPENSE_SESSIONS.pop(user_id, None)
                     reply_text(reply_token, "這張圖片不像發票或收據，因此沒有啟動代墊登記。")
                     continue
                 except requests.RequestException:
-                    EXPENSE_SESSIONS.pop(user_id, None)
                     reply_text(reply_token, "目前無法辨識單據，請稍後重新上傳。")
                     continue
                 data["project"] = batch.get("project", "")
@@ -1890,11 +1958,9 @@ async def webhook(request: Request):
                     session["pending_text"] = ""
                     data, missing = process_receipt_image(user_id, receipt_base64, receipt_mime)
                 except ValueError as error:
-                    session["step"] = "receipt_waiting_image"
                     reply_text(reply_token, str(error))
                     continue
                 except requests.RequestException:
-                    session["step"] = "receipt_waiting_image"
                     session["receiptBase64"] = receipt_base64
                     session["receiptMimeType"] = receipt_mime
                     reply_text(reply_token, "目前無法辨識收據，圖片已保留，請稍後再輸入「代墊」重試。")
@@ -1921,11 +1987,9 @@ async def webhook(request: Request):
                     EXPENSE_SESSIONS[user_id] = {"step": "receipt_processing", "updated_at": time.time(), "pending_text": "", "data": {"registrantUserId": user_id}}
                     data, missing = process_receipt_image(user_id, receipt_base64, receipt_mime)
                 except ValueError:
-                    EXPENSE_SESSIONS.pop(user_id, None)
                     reply_text(reply_token, "這張圖片目前無法確認為代墊單據，請重新拍攝清楚完整的收據或發票。")
                     continue
                 except requests.RequestException:
-                    EXPENSE_SESSIONS.pop(user_id, None)
                     reply_text(reply_token, "目前無法辨識單據，請稍後重新上傳。")
                     continue
                 data = merge_pending_receipt_text(user_id, data)
@@ -1937,33 +2001,15 @@ async def webhook(request: Request):
 
             if session.get("step") not in {"receipt", "quick_confirm", "quick_missing", "quick_edit"}:
                 continue
+            session["data"]["receiptBase64"] = receipt_base64
+            session["data"]["receiptMimeType"] = receipt_mime
             if session.get("step") == "receipt":
-                session["data"]["receiptBase64"] = receipt_base64
-                session["data"]["receiptMimeType"] = receipt_mime
                 session["step"] = "note"
                 reply_messages(reply_token, [next_prompt(session)])
             else:
-                # 文字草稿後補傳單據時，必須重新 OCR，再保留員工已填的專案與內容。
-                previous_data = dict(session.get("data", {}))
-                previous_step = session.get("step", "quick_confirm")
-                session["step"] = "receipt_processing"
-                try:
-                    start_loading(user_id)
-                    receipt_data, _ = process_receipt_image(user_id, receipt_base64, receipt_mime)
-                except (ValueError, requests.RequestException):
-                    session["step"] = previous_step
-                    reply_text(reply_token, "目前無法辨識單據，原本資料已保留，請重新拍攝後再上傳。")
-                    continue
-                # 單據辨識值為主，但不覆蓋員工已明確提供的專案、項目、內容與金額。
-                for field in ("project", "item", "category", "amount", "date", "payer"):
-                    if previous_data.get(field) not in (None, ""):
-                        receipt_data[field] = previous_data[field]
-                if previous_data.get("note"):
-                    receipt_data["note"] = previous_data["note"]
-                session["data"] = receipt_data
-                missing = missing_expense_fields(receipt_data)
-                session["step"] = "quick_missing" if missing else "quick_confirm"
-                reply_messages(reply_token, [build_project_or_missing_prompt(session, missing) if missing else build_expense_confirmation(receipt_data)])
+                session["data"]["note"] = "已附收據"
+                session["step"] = "quick_confirm"
+                reply_messages(reply_token, [build_expense_confirmation(session["data"])])
             continue
 
         if message_type != "text":
@@ -2051,6 +2097,22 @@ async def webhook(request: Request):
                 reply_text(reply_token, "目前無法讀取代墊統計，請稍後再試；本次沒有建立代墊紀錄。")
             continue
 
+        # 可直接理解「8月10號外案3萬」等自然語序，再一次補問其餘資料。
+        if source.get("type") == "user" and external_case.is_external_case_text(text):
+            if user_id not in INTERNAL_USER_IDS:
+                reply_text(reply_token, "你的帳號尚未加入公司內部登記名單。")
+                continue
+            employee_name = EXTERNAL_CASE_NAMES.get(user_id) or get_line_profile_name(user_id)
+            session = external_case.start(text, user_id, employee_name)
+            reply_messages(reply_token, [external_next_message(session)])
+            continue
+
+        external_session = external_case.get_session(user_id) if source.get("type") == "user" else None
+        if external_session and external_session.get("step") != "confirm":
+            session = external_case.accept_text(user_id, text)
+            reply_messages(reply_token, [external_next_message(session)])
+            continue
+
         # 圖片後直接輸入「代墊 PJR 專案」時，同時啟動 OCR 並累積本句資料。
         pending_receipt = get_expense_session(user_id) if source.get("type") == "user" else None
         if command.startswith("代墊") and command != "代墊" and pending_receipt and pending_receipt.get("step") == "receipt_waiting_trigger":
@@ -2131,10 +2193,6 @@ async def webhook(request: Request):
             )
         )
         if is_quick_expense:
-            # 已有確認圖卡時再次輸入完整「代墊…」句子，視為新的一筆，避免黏到舊草稿。
-            start_fresh = bool(session and session.get("step") == "quick_confirm" and "代墊" in command)
-            if start_fresh:
-                session = None
             previous_text = session.get("raw_text", "") if session else ""
             combined_text = f"{previous_text}，{text}".strip("，")
             data = merge_expense_text(session.get("data", {}) if session else {}, text, user_id)
