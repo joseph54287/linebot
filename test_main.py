@@ -70,13 +70,58 @@ def test_calendar_command_requires_exact_keyword_and_internal_user():
     for user_id in main.INTERNAL_USER_IDS:
         event["source"]["userId"] = user_id
         assert main.is_calendar_command(event) is True
-    event["message"]["text"] = "本週行程"
+    for text in ["今日行程", "今天的行程", "明天行程", "明日的行程", "後天行程", "這週的行程", "本週行程"]:
+        event["message"]["text"] = text
+        assert main.is_calendar_command(event) is True
+    event["message"]["text"] = "下週行程"
     assert main.is_calendar_command(event) is False
     event["message"]["text"] = "行程"
     event["source"]["userId"] = "U-other"
     assert main.is_calendar_command(event) is False
     event["source"] = {"type": "group", "userId": main.QUOTE_OWNER_USER_ID}
     assert main.is_calendar_command(event) is False
+
+
+def test_calendar_keyword_intents_ignore_particle_and_spaces():
+    assert main.calendar_query_intent("請給我今日行程") == "today"
+    assert main.calendar_query_intent("今天 的 行程") == "today"
+    assert main.calendar_query_intent("明天的行程") == "tomorrow"
+    assert main.calendar_query_intent("明日的行程") == "tomorrow"
+    assert main.calendar_query_intent("後天行程") == "day_after_tomorrow"
+    assert main.calendar_query_intent("這週的行程") == "week"
+    assert main.calendar_query_intent("本週行程") == "week"
+    assert main.calendar_query_intent("行程") == "today_tomorrow"
+    assert main.calendar_query_intent("下週行程") is None
+
+
+def test_single_day_and_week_calendar_cards(monkeypatch):
+    calls = []
+    event = {
+        "summary": "拍攝",
+        "start": {"dateTime": "2026-08-10T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-10T11:00:00+08:00"},
+    }
+
+    def fake_fetch(start, end):
+        calls.append((start, end))
+        return [event]
+
+    monkeypatch.setattr(main, "fetch_calendar_events", fake_fetch)
+    now = main.datetime(2026, 8, 9, 18, 0, tzinfo=main.TAIPEI_TZ)
+
+    tomorrow = main.calendar_command_message(now, "明天的行程")
+    assert tomorrow["altText"] == "明日行程"
+    assert tomorrow["contents"]["type"] == "bubble"
+    assert len(calls) == 1
+    assert calls[0][0].date().isoformat() == "2026-08-10"
+
+    calls.clear()
+    week = main.calendar_command_message(now, "這週的行程")
+    assert week["altText"] == "本週行程"
+    assert calls[0][0].date().isoformat() == "2026-08-03"
+    assert calls[0][1].date().isoformat() == "2026-08-10"
+    details = week["contents"]["body"]["contents"][0]["contents"][1]["text"]
+    assert details == "08/10 09:00–11:00"
 from starlette.requests import Request
 
 

@@ -188,8 +188,23 @@ def is_quote_event(event: dict[str, Any]) -> bool:
     return False
 
 
+def calendar_query_intent(text: str) -> str | None:
+    """依訊息中的日期關鍵字判斷要查詢的行程範圍。"""
+    normalized = re.sub(r"[\s的]", "", text.strip())
+    phrase_groups = (
+        ("week", ("這週行程", "本週行程")),
+        ("day_after_tomorrow", ("後天行程",)),
+        ("tomorrow", ("明天行程", "明日行程")),
+        ("today", ("今天行程", "今日行程")),
+    )
+    for intent, phrases in phrase_groups:
+        if any(phrase in normalized for phrase in phrases):
+            return intent
+    return "today_tomorrow" if normalized == "行程" else None
+
+
 def is_calendar_command(event: dict[str, Any]) -> bool:
-    """只允許三位內部成員在 Bot 個人聊天室使用精確關鍵字「行程」。"""
+    """只允許三位內部成員在 Bot 個人聊天室查詢指定日期範圍的行程。"""
     source = event.get("source", {})
     message = event.get("message", {})
     return (
@@ -197,7 +212,7 @@ def is_calendar_command(event: dict[str, Any]) -> bool:
         and source.get("type") == "user"
         and source.get("userId") in INTERNAL_USER_IDS
         and message.get("type") == "text"
-        and message.get("text", "").strip() == "行程"
+        and calendar_query_intent(message.get("text", "")) is not None
     )
 
 
@@ -368,24 +383,32 @@ def fetch_calendar_events(start: datetime, end: datetime) -> list[dict[str, Any]
     return sorted(events, key=sort_key)
 
 
-def calendar_event_time(item: dict[str, Any]) -> str:
+def calendar_event_time(item: dict[str, Any], include_date: bool = False) -> str:
     """將 Google Calendar 起訖時間轉為台北時間。"""
     start_data = item.get("start", {})
     if start_data.get("date"):
-        return "全天"
+        return f"{start_data['date'][5:].replace('-', '/')} 全天" if include_date else "全天"
     try:
         start = datetime.fromisoformat(start_data["dateTime"].replace("Z", "+00:00")).astimezone(TAIPEI_TZ)
         end = datetime.fromisoformat(item["end"]["dateTime"].replace("Z", "+00:00")).astimezone(TAIPEI_TZ)
     except (KeyError, ValueError):
         return "時間待確認"
-    return f"{start:%H:%M}–{end:%H:%M}"
+    prefix = f"{start:%m/%d} " if include_date else ""
+    return f"{prefix}{start:%H:%M}–{end:%H:%M}"
 
 
-def calendar_day_card(label: str, day: datetime, events: list[dict[str, Any]]) -> dict[str, Any]:
-    """建立單日藍色 LINE 行程圖卡。"""
+def calendar_day_card(
+    label: str,
+    day: datetime,
+    events: list[dict[str, Any]],
+    *,
+    subtitle: str | None = None,
+    include_event_date: bool = False,
+) -> dict[str, Any]:
+    """建立單日或日期範圍的藍色 LINE 行程圖卡。"""
     rows: list[dict[str, Any]] = []
     for item in events[:12]:
-        details = calendar_event_time(item)
+        details = calendar_event_time(item, include_event_date)
         if item.get("location"):
             details += f"｜{item['location']}"
         row_contents: list[dict[str, Any]] = [
@@ -412,19 +435,51 @@ def calendar_day_card(label: str, day: datetime, events: list[dict[str, Any]]) -
             "type": "box", "layout": "vertical", "backgroundColor": "#2563EB", "paddingAll": "20px",
             "contents": [
                 {"type": "text", "text": label, "color": "#FFFFFF", "weight": "bold", "size": "xl"},
-                {"type": "text", "text": day.strftime("%Y/%m/%d"), "color": "#DBEAFE", "size": "sm", "margin": "sm"},
+                {"type": "text", "text": subtitle or day.strftime("%Y/%m/%d"), "color": "#DBEAFE", "size": "sm", "margin": "sm"},
             ],
         },
         "body": {"type": "box", "layout": "vertical", "paddingAll": "16px", "contents": rows},
     }
 
 
-def calendar_command_message(now: datetime | None = None) -> dict[str, Any]:
-    """查詢今日與明日後，回傳可左右滑動的兩張圖卡。"""
+def calendar_command_message(now: datetime | None = None, text: str = "行程") -> dict[str, Any]:
+    """依日期關鍵字查詢單日、本週，或預設的今日與明日。"""
     current = (now or datetime.now(TAIPEI_TZ)).astimezone(TAIPEI_TZ)
     today = current.replace(hour=0, minute=0, second=0, microsecond=0)
     tomorrow = today + timedelta(days=1)
     day_after = tomorrow + timedelta(days=1)
+    intent = calendar_query_intent(text)
+
+    day_queries = {
+        "today": ("今日行程", today, tomorrow),
+        "tomorrow": ("明日行程", tomorrow, day_after),
+        "day_after_tomorrow": ("後天行程", day_after, day_after + timedelta(days=1)),
+    }
+    if intent in day_queries:
+        label, start, end = day_queries[intent]
+        return {
+            "type": "flex",
+            "altText": label,
+            "contents": calendar_day_card(label, start, fetch_calendar_events(start, end)),
+        }
+
+    if intent == "week":
+        week_start = today - timedelta(days=today.weekday())
+        next_week = week_start + timedelta(days=7)
+        week_end = next_week - timedelta(days=1)
+        label = "本週行程"
+        return {
+            "type": "flex",
+            "altText": label,
+            "contents": calendar_day_card(
+                label,
+                week_start,
+                fetch_calendar_events(week_start, next_week),
+                subtitle=f"{week_start:%m/%d}–{week_end:%m/%d}",
+                include_event_date=True,
+            ),
+        }
+
     today_events = fetch_calendar_events(today, tomorrow)
     tomorrow_events = fetch_calendar_events(tomorrow, day_after)
     return {
@@ -2041,11 +2096,11 @@ async def webhook(request: Request):
         text = message.get("text", "").strip()
         command = text.casefold()
 
-        # 三位內部成員在 Bot 個人聊天室輸入精確關鍵字「行程」時，讀取今日與明日。
+        # 三位內部成員可用今日、明日、後天、本週或「行程」查詢指定範圍。
         if is_calendar_command(event):
             try:
                 start_loading(user_id)
-                reply_messages(reply_token, [calendar_command_message()])
+                reply_messages(reply_token, [calendar_command_message(text=text)])
             except requests.RequestException:
                 reply_text(reply_token, "目前無法完整讀取 Google Calendar，請稍後再試；本次沒有將資料顯示為無行程。")
             continue
