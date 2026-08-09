@@ -21,6 +21,8 @@ function doPost(e) {
   if (body.action === 'expense_draft_save') return saveExpenseDraft_(body.userId, body.session);
   if (body.action === 'expense_draft_get') return getExpenseDraft_(body.userId);
   if (body.action === 'expense_draft_delete') return deleteExpenseDraft_(body.userId);
+  if (body.action === 'expense_receipt_upload') return prepareExpenseReceipt_(body.expense || {});
+  if (body.action === 'expense_status') return expenseStatus_(String(body.transactionId || '').trim());
   if (body.action === 'expense') return saveExpense_(body.expense || {});
   if (body.action === 'supplement') return updateSupplement_(body.supplement || {});
   return doPostGroup_(e);
@@ -88,8 +90,46 @@ function saveExpense_(expense) {
   if (!lock.tryLock(25000)) return json_({ ok: false, error: 'expense_write_busy' });
   try {
     return saveExpenseLocked_(expense);
+  } catch (error) {
+    return json_({ ok: false, error: 'expense_write_failed', detail: String(error && error.message || error).slice(0, 200) });
   } finally {
     lock.releaseLock();
+  }
+}
+
+function prepareExpenseReceipt_(expense) {
+  try {
+    const transactionId = String(expense.transactionId || '').trim();
+    if (!transactionId) return json_({ ok: false, error: 'transaction_id_required' });
+    const properties = PropertiesService.getScriptProperties();
+    const key = 'expense_receipt_' + transactionId.replace(/[^0-9A-Za-z_-]/g, '').slice(0, 80);
+    const existingUrl = properties.getProperty(key);
+    if (existingUrl) return json_({ ok: true, receiptUrl: existingUrl, reused: true });
+    if (!expense.receiptBase64) return json_({ ok: true, receiptUrl: '' });
+    const receiptUrl = saveExpenseReceipt_(expense);
+    properties.setProperty(key, receiptUrl);
+    return json_({ ok: true, receiptUrl: receiptUrl, reused: false });
+  } catch (error) {
+    return json_({ ok: false, error: 'receipt_upload_failed', detail: String(error && error.message || error).slice(0, 200) });
+  }
+}
+
+function expenseStatus_(transactionId) {
+  try {
+    if (!transactionId) return json_({ ok: false, error: 'transaction_id_required' });
+    const sheet = SpreadsheetApp.openById(EXPENSE_SHEET_ID_).getSheetByName(EXPENSE_SHEET_NAME_);
+    if (!sheet) return json_({ ok: false, error: 'expense_sheet_not_found' });
+    const lastRow = sheet.getLastRow();
+    if (lastRow < 2) return json_({ ok: true, found: false });
+    const values = sheet.getRange(2, 1, lastRow - 1, Math.max(29, sheet.getLastColumn())).getValues();
+    for (let index = values.length - 1; index >= 0; index--) {
+      if (String(values[index][15] || '').trim() !== transactionId) continue;
+      const row = index + 2;
+      return json_({ ok: true, found: true, row: row, transactionId: transactionId, receiptUrl: String(values[index][9] || ''), recordUrl: expenseRecordUrl_(sheet, row) });
+    }
+    return json_({ ok: true, found: false });
+  } catch (error) {
+    return json_({ ok: false, error: 'expense_status_failed', detail: String(error && error.message || error).slice(0, 200) });
   }
 }
 
@@ -107,7 +147,7 @@ function saveExpenseLocked_(expense) {
   }
 
   // 必須先完成重複檢查，才保存圖片，避免重複附件。
-  const receiptUrl = saveExpenseReceipt_(expense);
+  const receiptUrl = String(expense.receiptUrl || '') || saveExpenseReceipt_(expense);
   const now = new Date();
   const missingReasons = expenseMissingReasons_(expense);
   const supplementStatus = missingReasons.length ? '待補件' : '資料完整';
@@ -128,7 +168,7 @@ function saveExpenseLocked_(expense) {
 function expenseMissingReasons_(expense) {
   const reasons = [];
   if (expense.companyTaxIdValid !== true) reasons.push('缺少統編');
-  if (!expense.receiptBase64) reasons.push('缺少收據');
+  if (!expense.receiptBase64 && !expense.receiptUrl) reasons.push('缺少收據');
   if (Number(expense.receiptConfidence || 1) < 0.75) reasons.push('圖片不清楚');
   if (!String(expense.project || '').trim() || String(expense.project || '').trim() === '專案無') reasons.push('專案待確認');
   if (!Number(expense.amount || 0) || Number(expense.receiptConfidence || 1) < 0.65) reasons.push('金額需要確認');
