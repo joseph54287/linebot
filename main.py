@@ -19,6 +19,7 @@ import requests
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+APP_RELEASE = "2026-08-09-expense-v10"
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 GROUP_REGISTRY_URL = os.environ.get("GROUP_REGISTRY_URL", "").rstrip("/")
@@ -1842,6 +1843,7 @@ async def health():
     """供 Render 確認服務與必要環境變數是否正常。"""
     return {
         "status": "ok",
+        "release": APP_RELEASE,
         "line_secret_configured": bool(LINE_CHANNEL_SECRET),
         "line_token_configured": bool(LINE_CHANNEL_ACCESS_TOKEN),
         "registry_configured": bool(
