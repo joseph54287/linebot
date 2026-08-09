@@ -410,6 +410,35 @@ def test_complete_expense_text_replies_with_confirmation_card(monkeypatch):
     assert "加油／汽油費" in payload
 
 
+def test_text_receipt_link_keeps_text_fields_and_locks_first_image(monkeypatch):
+    """補傳照片只能綁定附件，不能覆蓋文字判定的專案、項目與金額。"""
+    monkeypatch.setattr(main.time, "time", lambda: 1000)
+    session = {
+        "step": "quick_confirm",
+        "updated_at": 1000,
+        "data": {"project": "PJR", "item": "交通", "amount": 500, "note": "加油費"},
+    }
+    main.activate_text_receipt_link("U-test", session)
+    assert main.attach_receipt_to_text_session(session, "first-image", "image/jpeg", now=1001) == "attached"
+    assert session["data"]["project"] == "PJR"
+    assert session["data"]["item"] == "交通"
+    assert session["data"]["amount"] == 500
+    assert session["data"]["receiptBase64"] == "first-image"
+    assert main.attach_receipt_to_text_session(session, "first-image", "image/jpeg", now=1002) == "duplicate"
+    assert main.attach_receipt_to_text_session(session, "other-image", "image/jpeg", now=1002) == "locked"
+    assert session["data"]["receiptBase64"] == "first-image"
+
+
+def test_text_receipt_link_expires_after_five_minutes():
+    session = {
+        "sourceMode": "text",
+        "linkExpiresAt": 1000,
+        "data": {"project": "PJR", "item": "交通", "amount": 500},
+    }
+    assert main.attach_receipt_to_text_session(session, "late-image", "image/jpeg", now=1001) == "not_applicable"
+    assert "receiptBase64" not in session["data"]
+
+
 def test_new_session_starts_with_date():
     session = main.new_expense_session("U-test")
     assert session["step"] == "date"
