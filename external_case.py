@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import time
+import unicodedata
 import uuid
 from datetime import datetime
 from typing import Any, Callable
@@ -36,11 +37,26 @@ def parse_date(text: str, now: datetime | None = None) -> str:
 
 
 def parse_amount(text: str) -> int | None:
-    match = re.search(r"(?:NT\$|[$＄])?\s*(\d+(?:\.\d+)?)\s*萬", text, re.I)
+    normalized = unicodedata.normalize("NFKC", text)
+    normalized = re.sub(r"[\u200b-\u200d\ufeff]", "", normalized)
+    normalized = normalized.replace("，", ",")
+    match = re.search(r"(?:NT\$|\$)?\s*([\d,]+(?:\.\d+)?)\s*萬", normalized, re.I)
     if match:
-        value = float(match.group(1)) * 10_000
+        value = float(match.group(1).replace(",", "")) * 10_000
         return int(value) if value > 0 and value.is_integer() else None
-    match = re.search(r"(?:金額\s*[：:]?\s*|NT\$|[$＄])\s*([\d,]+)|([\d,]+)\s*(?:元|塊)", text, re.I)
+    chinese_ten_thousand = re.search(r"(?:^|\D)(十|[一二兩三四五六七八九]\s*十?|十\s*[一二三四五六七八九])\s*萬", normalized)
+    if chinese_ten_thousand:
+        token = re.sub(r"\s+", "", chinese_ten_thousand.group(1))
+        digits = {"一": 1, "二": 2, "兩": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+        if token == "十":
+            units = 10
+        elif "十" in token:
+            left, right = token.split("十", 1)
+            units = digits.get(left, 1) * 10 + digits.get(right, 0)
+        else:
+            units = digits.get(token, 0)
+        return units * 10_000 if units > 0 else None
+    match = re.search(r"(?:金額\s*[：:]?\s*|NT\$|\$)\s*([\d,]+)|([\d,]+)\s*(?:元|塊)", normalized, re.I)
     if not match:
         return None
     raw = next((part for part in match.groups() if part), "")
@@ -65,7 +81,7 @@ def parse_payment_date(text: str, now: datetime | None = None) -> str:
 
 def parse_initial(text: str, user_id: str, employee_name: str) -> dict[str, Any]:
     entered_amount = parse_amount(text)
-    tax_mode = "含稅" if "含稅" in text else "稅外"
+    tax_mode = "含稅" if re.search(r"含\s*稅", unicodedata.normalize("NFKC", text)) else "稅外"
     pretax_amount = round(entered_amount / 1.05) if entered_amount and tax_mode == "含稅" else entered_amount
     return {
         "requestId": str(uuid.uuid4()),
