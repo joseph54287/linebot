@@ -4,6 +4,7 @@ import asyncio
 import json
 
 import main
+import external_case
 
 
 def test_calendar_command_merges_two_days_into_blue_cards(monkeypatch):
@@ -80,6 +81,14 @@ from starlette.requests import Request
 
 
 QUOTE_USER_ID = "Ub983deb79584603885e5b28e9fdf2d5d"
+
+
+def test_external_case_natural_message_and_tax_are_available_from_main_service():
+    assert main.external_case is external_case
+    data = external_case.parse_initial("8 月 10 號外案 3 萬", "U-test", "爾賢")
+    assert data["amount"] == 30000
+    assert external_case.tax_amounts(data) == (30000, 1500, 31500)
+    assert external_case.next_step(data) == "details"
 
 
 def all_actions(value):
