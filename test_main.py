@@ -136,7 +136,8 @@ def test_parse_complete_natural_language(monkeypatch):
     assert data["amount"] == 850
     assert data["payer"] == "周暐"
     assert data["category"] == "案件支出（餐飲、道具、人員...）"
-    assert data["note"] == "未附收據"
+    assert "消費內容：拍攝餐費" in data["note"]
+    assert "未附收據" in data["note"]
 
 
 def test_parse_lists_all_missing_fields_at_once():
@@ -147,7 +148,18 @@ def test_parse_lists_all_missing_fields_at_once():
     assert data["payer"] == "阿全"
     assert "金額" in missing
     assert "專案名稱" in missing
-    assert "項目分類或更清楚的消費內容" in missing
+    assert "項目分類或更清楚的消費內容" not in missing
+
+
+def test_fuel_text_keeps_category_and_human_readable_content():
+    data, missing = main.parse_expense_text(
+        "代墊 PJR 專案加油汽油費 500 元",
+        "U6c6441cb38102499d1f80d4ea79a53ab",
+    )
+    assert missing == []
+    assert data["item"] == "交通"
+    assert data["expenseContent"] == "加油／汽油費"
+    assert "消費內容：加油／汽油費" in data["note"]
 
 
 def test_year_is_not_mistaken_for_amount():
