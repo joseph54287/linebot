@@ -130,7 +130,12 @@ QUOTE_USER_ID = "Ub983deb79584603885e5b28e9fdf2d5d"
 
 def test_external_case_approval_owner_is_kao_er_hsien():
     assert main.EXTERNAL_CASE_OWNER_USER_ID == QUOTE_USER_ID
-    assert main.EXTERNAL_CASE_TEST_MODE is True
+    assert main.EXTERNAL_CASE_TEST_MODE is False
+    assert {
+        "U6c6441cb38102499d1f80d4ea79a53ab",  # 周暐
+        "Ub983deb79584603885e5b28e9fdf2d5d",  # 高爾賢
+        "U9478b00702c716685d9d8b021d62d538",  # 阿筌
+    }.issubset(main.INTERNAL_USER_IDS)
 
 
 def test_external_case_owner_card_has_confirm_and_discuss_only():
