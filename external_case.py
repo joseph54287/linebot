@@ -209,18 +209,26 @@ def approval_card(data: dict[str, Any]) -> dict[str, Any]:
     pretax, tax, gross = tax_amounts(data)
     employee_share = round(data["amount"] * 0.4)
     company_share = data["amount"] - employee_share
-    summary = "\n".join([
-        f"{data['employeeName']}｜{data['projectName']}", f"日期：{data['date']}",
-        f"未稅：{money(pretax)}｜稅額：{money(tax)}｜含稅：{money(gross)}", f"案型：{data['caseType']}",
-        f"款項匯入：{data['destination']}", f"員工 40%：{money(employee_share)}", f"公司 60%：{money(company_share)}",
-        f"預計匯款：{data['paymentDate']}", f"聯繫窗口：{data['contact']}",
-    ])
     request_id = data["requestId"]
-    return {"type": "template", "altText": f"{data['employeeName']}送出外案申請", "template": {
-        "type": "buttons", "title": "外案待核准", "text": summary[:160], "actions": [
-            {"type": "postback", "label": "確認成立", "data": f"external:approve:{request_id}", "displayText": "確認成立"},
-            {"type": "postback", "label": "待討論", "data": f"external:discuss:{request_id}", "displayText": "待討論"},
-        ],
+    rows = [
+        ("申請人", data["employeeName"]), ("案名", data["projectName"]), ("案件日期", data["date"]),
+        ("案型", data["caseType"]), ("未稅金額", money(pretax)), ("稅額", money(tax)),
+        ("含稅收款", money(gross)), ("款項進入", data["destination"]),
+        ("員工 40%", money(employee_share)), ("公司 60%", money(company_share)),
+        ("預計匯款日", data["paymentDate"]), ("聯繫窗口", data["contact"]),
+    ]
+    body = [{"type": "text", "text": f"{label}：{value}", "size": "sm", "color": "#1F2937", "wrap": True, "margin": "md"} for label, value in rows]
+    return {"type": "flex", "altText": f"{data['employeeName']}送出外案申請，等待核准", "contents": {
+        "type": "bubble",
+        "header": {"type": "box", "layout": "vertical", "backgroundColor": "#193B65", "paddingAll": "20px", "contents": [
+            {"type": "text", "text": "外案待核准", "color": "#FFFFFF", "size": "xl", "weight": "bold"},
+            {"type": "text", "text": "請選擇確認成立或待討論", "color": "#DCE7F5", "size": "xs", "margin": "sm"},
+        ]},
+        "body": {"type": "box", "layout": "vertical", "paddingAll": "20px", "contents": body},
+        "footer": {"type": "box", "layout": "vertical", "spacing": "sm", "paddingAll": "20px", "contents": [
+            {"type": "button", "style": "primary", "color": "#193B65", "action": {"type": "postback", "label": "確認成立", "data": f"external:approve:{request_id}", "displayText": "確認成立"}},
+            {"type": "button", "style": "secondary", "action": {"type": "postback", "label": "待討論", "data": f"external:discuss:{request_id}", "displayText": "待討論"}},
+        ]},
     }}
 
 
