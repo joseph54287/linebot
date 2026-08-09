@@ -4,10 +4,36 @@ import asyncio
 import json
 
 import main
+import external_case
 from starlette.requests import Request
 
 
 QUOTE_USER_ID = "Ub983deb79584603885e5b28e9fdf2d5d"
+
+
+def test_external_case_short_message_understands_date_and_ten_thousand():
+    data = external_case.parse_initial(
+        "外案 8月10號 1萬", "U-test", "周暐"
+    )
+    assert data["date"].endswith("-08-10")
+    assert data["amount"] == 10000
+    assert external_case.next_step(data) == "projectName"
+
+
+def test_external_case_conversation_only_asks_missing_fields():
+    session = external_case.start("外案 8/10 1.5萬 剪片", "U-external", "阿全")
+    assert session["data"]["amount"] == 15000
+    assert session["data"]["caseType"] == "剪輯"
+    assert session["step"] == "projectName"
+    session = external_case.accept_text("U-external", "品牌活動精華")
+    assert session["step"] == "destination"
+    session = external_case.accept_option("U-external", "destination", "公司")
+    assert session["step"] == "confirm"
+    assert session["data"]["projectName"] == "品牌活動精華"
+
+
+def test_external_case_invalid_date_is_not_guessed():
+    assert external_case.parse_date("外案 2月30號 1萬") == ""
 
 
 def quote_event(event_type="postback", user_id=QUOTE_USER_ID, source_type="user"):
