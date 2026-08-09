@@ -146,7 +146,7 @@ def test_parse_lists_all_missing_fields_at_once():
     )
     assert data["payer"] == "阿全"
     assert "金額" in missing
-    assert "專案名稱（沒有專案請寫「專案無」）" in missing
+    assert "專案名稱" in missing
     assert "項目分類或更清楚的消費內容" in missing
 
 
@@ -212,7 +212,7 @@ def test_receipt_analysis_creates_one_expense_row():
     assert data["invoice"] == "是"
     assert data["companyTaxIdValid"] is True
     assert "統編" not in data["note"]
-    assert missing == ["專案名稱（沒有專案請寫「專案無」）"]
+    assert missing == ["專案名稱"]
 
 
 def test_receipt_rejects_clear_non_receipt_image():
@@ -268,7 +268,7 @@ def test_receipt_false_flag_is_accepted_when_fields_are_valid():
     assert data["amount"] == 420
     assert data["item"] == ""
     assert "消費項目" in missing
-    assert "專案名稱（沒有專案請寫「專案無」）" in missing
+    assert "專案名稱" in missing
 
 
 def test_process_receipt_uses_second_pass_to_find_total(monkeypatch):
@@ -309,9 +309,9 @@ def test_project_card_uses_short_index_postbacks():
     card = main.project_candidate_card([{"id": "p1", "name": "很長的專案名稱測試"}])
     buttons = card["contents"]["body"]["contents"]
     assert buttons[0]["action"]["data"] == "expense:project:0"
-    assert buttons[-3]["action"]["data"] == "expense:project:search"
-    assert buttons[-2]["action"]["data"] == "expense:project:none"
+    assert buttons[-2]["action"]["data"] == "expense:project:search"
     assert buttons[-1]["action"]["data"] == "expense:cancel"
+    assert all(button["action"]["data"] != "expense:project:none" for button in buttons)
 
 
 def test_project_phrases_are_understood():
@@ -362,7 +362,7 @@ def test_cpc_receipt_is_classified_as_transportation():
     )
     assert data["item"] == "交通"
     assert data["amount"] == 500
-    assert missing == ["專案名稱（沒有專案請寫「專案無」）"]
+    assert missing == ["專案名稱"]
 
 
 def test_unknown_item_and_no_answer_show_action_cards(monkeypatch):
@@ -373,7 +373,7 @@ def test_unknown_item_and_no_answer_show_action_cards(monkeypatch):
     assert buttons[-1]["action"]["data"] == "expense:cancel"
 
     monkeypatch.setattr(main, "get_recent_open_projects", lambda context: [])
-    project_message = main.build_project_or_missing_prompt(session, ["專案名稱（沒有專案請寫「專案無」）"])
+    project_message = main.build_project_or_missing_prompt(session, ["專案名稱"])
     project_buttons = project_message["contents"]["body"]["contents"]
     assert project_buttons[0]["action"]["data"] == "expense:project:search"
     assert project_buttons[-1]["action"]["data"] == "expense:cancel"
@@ -385,7 +385,7 @@ def test_submit_expense_adds_attachment_metadata(monkeypatch):
             return None
 
         def json(self):
-            return {"ok": True, "receiptUrl": "https://drive.google.com/test"}
+            return {"ok": True, "row": 12, "transactionId": "tx-1", "receiptUrl": "https://drive.google.com/test"}
 
     captured = {}
 
@@ -459,7 +459,7 @@ def test_project_card_paginates_with_absolute_indexes():
 
 def test_result_cards_distinguish_success_and_duplicate():
     data = {"project": "PJR", "item": "交通", "amount": 500}
-    success = main.expense_result_card(data, {"ok": True, "recordUrl": "https://example.com/row"})
+    success = main.expense_result_card(data, {"ok": True, "recordUrl": "https://example.com/row", "continuous": True})
     duplicate = main.expense_result_card(data, {"ok": True, "duplicate": True, "recordUrl": "https://example.com/old"})
     assert success["template"]["title"] == "代墊登記完成"
     assert any(action.get("data") == "expense:new" for action in success["template"]["actions"])
