@@ -95,6 +95,7 @@ def parse_initial(text: str, user_id: str, employee_name: str) -> dict[str, Any]
         "projectName": "",
         "destination": "",
         "paymentDate": parse_payment_date(text),
+        "contact": "",
     }
 
 
@@ -110,7 +111,7 @@ def next_step(data: dict[str, Any]) -> str:
     for field in ["date", "amount"]:
         if not data.get(field):
             return field
-    if any(not data.get(field) for field in ["projectName", "caseType", "destination", "paymentDate"]):
+    if any(not data.get(field) for field in ["projectName", "caseType", "destination", "paymentDate", "contact"]):
         return "details"
     return "confirm"
 
@@ -125,13 +126,12 @@ def prompt(step: str) -> dict[str, Any]:
         return {"type": "text", "text": texts[step]}
     if step == "details":
         return {"type": "text", "text": (
-            "金額收到。\n\n"
-            "請再補這 4 項：\n"
-            "案名：＿＿＿\n"
+            "金額收到，請再補這五項\n\n"
+            "案名：\n"
             "案型：導演案／剪接案／製片案／其他\n"
-            "款項：公司／員工個人／尚未確認\n"
-            "預計匯款日：＿＿月＿＿日\n\n"
-            "可以直接複製這四行回答。"
+            "款項進入：公司／員工個人／尚未確認\n"
+            "預計匯款日：\n"
+            "聯繫窗口："
         )}
     options = CASE_TYPES if step == "caseType" else DESTINATIONS
     title = "這是什麼類型的案子？" if step == "caseType" else "客戶的款項會匯到哪裡？"
@@ -155,10 +155,11 @@ def tax_amounts(data: dict[str, Any]) -> tuple[int, int, int]:
 
 
 def parse_details(text: str) -> dict[str, str]:
-    result = {"projectName": "", "caseType": infer_case_type(text), "destination": "", "paymentDate": parse_payment_date(text)}
+    result = {"projectName": "", "caseType": infer_case_type(text), "destination": "", "paymentDate": parse_payment_date(text), "contact": ""}
     project = re.search(r"(?:案名|專案名稱|專案)\s*[：:]\s*([^\n]+)", text)
     case_type = re.search(r"案型\s*[：:]\s*([^\n]+)", text)
-    destination = re.search(r"(?:款項|入帳)\s*[：:]\s*([^\n]+)", text)
+    destination = re.search(r"(?:款項(?:進入|匯入)?|入帳)\s*[：:]\s*([^\n]+)", text)
+    contact = re.search(r"(?:聯繫|聯絡)窗口\s*[：:]\s*([^\n]+)", text)
     if project:
         result["projectName"] = project.group(1).strip()
     if case_type:
@@ -171,6 +172,8 @@ def parse_details(text: str) -> dict[str, str]:
         result["destination"] = "尚未確認"
     elif "公司" in destination_text:
         result["destination"] = "公司"
+    if contact:
+        result["contact"] = contact.group(1).strip()
     return result
 
 
@@ -182,7 +185,7 @@ def confirmation_card(data: dict[str, Any]) -> dict[str, Any]:
         data["projectName"], f"日期：{data['date']}", f"輸入方式：{data.get('taxMode', '稅外')}",
         f"未稅：{money(pretax)}｜稅額：{money(tax)}", f"公司收款總額：{money(gross)}",
         f"案型：{data['caseType']}", f"款項匯入：{data['destination']}", "",
-        f"預計匯款：{data['paymentDate']}",
+        f"預計匯款：{data['paymentDate']}", f"聯繫窗口：{data['contact']}",
         f"你應得：{money(employee_share)}", f"公司應得：{money(company_share)}",
     ])
     return {"type": "template", "altText": "請最後確認外案資料", "template": {
@@ -200,7 +203,7 @@ def approval_card(data: dict[str, Any]) -> dict[str, Any]:
         f"{data['employeeName']}｜{data['projectName']}", f"日期：{data['date']}",
         f"未稅：{money(pretax)}｜稅額：{money(tax)}｜含稅：{money(gross)}", f"案型：{data['caseType']}",
         f"款項匯入：{data['destination']}", f"員工 40%：{money(employee_share)}", f"公司 60%：{money(company_share)}",
-        f"預計匯款：{data['paymentDate']}",
+        f"預計匯款：{data['paymentDate']}", f"聯繫窗口：{data['contact']}",
     ])
     request_id = data["requestId"]
     return {"type": "template", "altText": f"{data['employeeName']}送出外案申請", "template": {
