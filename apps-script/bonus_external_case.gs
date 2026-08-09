@@ -40,11 +40,16 @@ function bonusSubmit_(spreadsheet, data) {
   if (!Number.isFinite(amount) || amount <= 0) return {ok:false,error:'Invalid amount'};
   if (!['公司','員工個人','尚未確認'].includes(data.destination)) return {ok:false,error:'Invalid destination'};
   const sheet = bonusLog_(spreadsheet);
-  const found = sheet.getRange('A:A').createTextFinder(String(data.requestId)).matchEntireCell(true).findNext();
-  if (found) return {ok:true,duplicate:true,requestId:data.requestId};
   const taxMode = data.taxMode === '含稅' ? '含稅' : '稅外';
   const grossAmount = taxMode === '含稅' ? Number(data.enteredAmount) : Math.round(amount * 1.05);
   const taxAmount = grossAmount - amount;
+  const found = sheet.getRange('A:A').createTextFinder(String(data.requestId)).matchEntireCell(true).findNext();
+  if (found) {
+    const row = found.getRow();
+    sheet.getRange(row,5,1,5).setValues([[new Date(data.date),data.projectName,amount,data.caseType,data.destination]]);
+    sheet.getRange(row,14,1,5).setValues([[new Date(data.paymentDate),taxMode,taxAmount,grossAmount,data.contact]]);
+    return {ok:true,duplicate:true,requestId:data.requestId};
+  }
   sheet.appendRow([data.requestId,'待核准',data.employeeName,data.employeeUserId,new Date(data.date),data.projectName,amount,data.caseType,data.destination,new Date(),'','','',new Date(data.paymentDate),taxMode,taxAmount,grossAmount,data.contact]);
   return {ok:true,requestId:data.requestId};
 }
