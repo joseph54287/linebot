@@ -218,8 +218,8 @@ def approval_card(data: dict[str, Any]) -> dict[str, Any]:
     request_id = data["requestId"]
     return {"type": "template", "altText": f"{data['employeeName']}送出外案申請", "template": {
         "type": "buttons", "title": "外案待核准", "text": summary[:160], "actions": [
-            {"type": "postback", "label": "核准並登記", "data": f"external:approve:{request_id}", "displayText": "核准外案"},
-            {"type": "postback", "label": "拒絕", "data": f"external:reject:{request_id}", "displayText": "拒絕外案"},
+            {"type": "postback", "label": "確認成立", "data": f"external:approve:{request_id}", "displayText": "確認成立"},
+            {"type": "postback", "label": "待討論", "data": f"external:discuss:{request_id}", "displayText": "待討論"},
         ],
     }}
 
