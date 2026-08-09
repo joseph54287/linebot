@@ -11,7 +11,7 @@ function handleBonusPost_(payload) {
     try {
       if (payload.action === 'submit') return bonusJson_(bonusSubmit_(spreadsheet, payload.data || {}));
       if (payload.action === 'approve') return bonusJson_(bonusResolve_(spreadsheet, payload, true));
-      if (payload.action === 'reject') return bonusJson_(bonusResolve_(spreadsheet, payload, false));
+      if (payload.action === 'discuss' || payload.action === 'reject') return bonusJson_(bonusDiscuss_(spreadsheet, payload));
     } finally {
       lock.releaseLock();
     }
@@ -62,12 +62,7 @@ function bonusResolve_(spreadsheet, payload, approved) {
   const values = sheet.getRange(row,1,1,18).getValues()[0];
   const status = values[1];
   const result = {ok:true,employeeName:values[2],employeeUserId:values[3],projectName:values[5]};
-  if (status === '已核准' || status === '已拒絕') return Object.assign(result,{duplicate:true,status:status});
-  if (!approved) {
-    sheet.getRange(row,2).setValue('已拒絕');
-    sheet.getRange(row,11,1,2).setValues([[payload.approverUserId || '',new Date()]]);
-    return Object.assign(result,{status:'已拒絕'});
-  }
+  if (status === '已核准') return Object.assign(result,{duplicate:true,status:status});
   if (values[8] === '尚未確認') return {ok:false,error:'Destination unresolved'};
   const projectRow = bonusInsertProject_(spreadsheet, {
     requestId:values[0], employeeName:values[2], date:values[4], projectName:values[5],
@@ -77,6 +72,20 @@ function bonusResolve_(spreadsheet, payload, approved) {
   sheet.getRange(row,2).setValue('已核准');
   sheet.getRange(row,11,1,3).setValues([[payload.approverUserId || '',new Date(),projectRow]]);
   return Object.assign(result,{status:'已核准',projectRow:projectRow});
+}
+
+function bonusDiscuss_(spreadsheet, payload) {
+  const sheet = bonusLog_(spreadsheet);
+  const found = sheet.getRange('A:A').createTextFinder(String(payload.requestId || '')).matchEntireCell(true).findNext();
+  if (!found) return {ok:false,error:'Not found'};
+  const row = found.getRow();
+  const values = sheet.getRange(row,1,1,18).getValues()[0];
+  const result = {ok:true,employeeName:values[2],employeeUserId:values[3],projectName:values[5]};
+  if (values[1] === '已核准') return {ok:false,error:'Already approved'};
+  if (values[1] === '待討論') return Object.assign(result,{duplicate:true,status:'待討論'});
+  sheet.getRange(row,2).setValue('待討論');
+  sheet.getRange(row,11,1,2).setValues([[payload.approverUserId || '',new Date()]]);
+  return Object.assign(result,{status:'待討論'});
 }
 
 function bonusInsertProject_(spreadsheet, data) {
