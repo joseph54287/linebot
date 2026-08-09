@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import base64
-import asyncio
 import hashlib
 import hmac
 import logging
@@ -57,6 +56,7 @@ OWNER_USER_ID = os.environ.get(
 )
 # 外案最終核准人固定為高爾賢的 LINE 帳號；避免其他系統的 OWNER_USER_ID 誤導核准通知。
 EXTERNAL_CASE_OWNER_USER_ID = "Ub983deb79584603885e5b28e9fdf2d5d"
+EXTERNAL_CASE_TEST_MODE = True
 DEFAULT_INTERNAL_USER_IDS = (
     "U6c6441cb38102499d1f80d4ea79a53ab,"
     "Ub983deb79584603885e5b28e9fdf2d5d,"
@@ -1197,9 +1197,6 @@ def next_prompt(session: dict[str, Any]) -> dict[str, Any]:
 def build_expense_confirmation(data: dict[str, Any]) -> dict[str, Any]:
     """建立送出前的資料確認圖卡。"""
     has_receipt = bool(data.get("receiptBase64"))
-    tax_status = str(data.get("companyTaxIdStatus") or "")
-    tax_label = "已確認" if data.get("companyTaxIdValid") else ("待人工確認" if tax_status == "pending_manual" else "未辨識")
-    tax_color = "#047857" if data.get("companyTaxIdValid") else ("#64748B" if tax_status == "pending_manual" else "#EA580C")
     body_contents = [
         ui_row("日期", str(data.get("date", "")).replace("-", "/")),
         ui_row("專案", data.get("project", "")),
@@ -1208,12 +1205,10 @@ def build_expense_confirmation(data: dict[str, Any]) -> dict[str, Any]:
         ui_row("金額", f"${data.get('amount', '')}", "#193B65", "xl"),
         ui_row("支出人", data.get("payer", "")),
         ui_row("收據", "已儲存" if has_receipt else "待補收據", "#047857" if has_receipt else "#B45309"),
-        ui_row("公司統編", tax_label, tax_color),
+        ui_row("公司統編", "已確認" if data.get("companyTaxIdValid") else "未辨識", "#047857" if data.get("companyTaxIdValid") else "#EA580C"),
         ui_row("特別備註", data.get("specialNote") or "無"),
     ]
-    if tax_status == "pending_manual":
-        body_contents.append(ui_warning("收據照片已保存；依補傳設定不重新辨識內容，統編改列待人工確認。", "info"))
-    elif not data.get("companyTaxIdValid"):
+    if not data.get("companyTaxIdValid"):
         body_contents.append(ui_warning("此單據未辨識到公司統編，仍可送出，之後會列入待補件。"))
     elif not has_receipt:
         body_contents.append(ui_warning("尚未附上收據；確認送出後會列入待補件。"))
@@ -1333,7 +1328,6 @@ documentType, merchantName, date(YYYY-MM-DD或空字串), items(字串陣列),
 totalAmount(數字或null), invoiceNumber, buyerTaxId, sellerTaxId,
 rawText(單據上可見文字逐行合併), currency(預設TWD), confidence(0到1), warnings(字串陣列), isReceipt(布林值), imageType(簡短字串)。
 buyerTaxId 只能填寫買受人／買方／客戶的統一編號；sellerTaxId 只能填寫商家／賣方的統一編號，兩者不可混用。
-公司統編是 90531465。請特別逐字檢查「買方、買受人、統編」附近是否完整出現這 8 碼，並保留在 buyerTaxId 與 rawText。
 即使無法判斷統編屬於買方或賣方，也必須把可見號碼原樣保留在 rawText，不可省略。
 totalAmount 必須是整張單據的應付或實付總額，不可使用統編、發票號碼、日期或交易序號。
 看不清楚就留空並在 warnings 說明，不要猜測。"""
@@ -1426,8 +1420,8 @@ def normalize_tax_id(value: Any) -> str:
 
 
 def has_valid_company_tax_id(analysis: dict[str, Any]) -> bool:
-    """任何 OCR 統編欄位或原文完整出現公司統編即通過，不接受部分相符。"""
-    if any(normalize_tax_id(analysis.get(field)) == COMPANY_TAX_ID for field in ["buyerTaxId", "sellerTaxId", "taxId", "companyTaxId"]):
+    """買方欄位或 OCR 原文完整出現公司統編即通過，不接受部分相符。"""
+    if normalize_tax_id(analysis.get("buyerTaxId")) == COMPANY_TAX_ID:
         return True
     raw_text = str(analysis.get("rawText") or "")
     candidates = re.findall(r"(?<!\d)(\d(?:[\s\-－]?\d){7})(?!\d)", raw_text)
@@ -1732,6 +1726,13 @@ async def webhook(request: Request):
                     except requests.RequestException:
                         reply_text(reply_token, "目前無法送出核准，內容還在，請稍後再按一次。")
                         continue
+                    if user_id == EXTERNAL_CASE_OWNER_USER_ID:
+                        external_case.SESSIONS.pop(user_id, None)
+                        reply_messages(reply_token, [
+                            {"type": "text", "text": "已送出，現在是「待核准」。請在下方選擇「確認成立」或「待討論」。"},
+                            external_case.approval_card(session["data"]),
+                        ])
+                        continue
                     notification_sent = True
                     try:
                         push_messages(EXTERNAL_CASE_OWNER_USER_ID, [external_case.approval_card(session["data"])])
@@ -1913,7 +1914,7 @@ async def webhook(request: Request):
                 session["continuous"] = action == "confirm_continuous"
                 try:
                     session["data"]["registrantName"] = get_line_profile_name(user_id)
-                    result = await asyncio.to_thread(submit_expense, session["data"])
+                    result = submit_expense(session["data"])
                 except requests.RequestException as error:
                     session["submitting"] = False
                     error_code = str(error) or "unknown"
@@ -1966,8 +1967,8 @@ async def webhook(request: Request):
                     reply_messages(reply_token, [build_expense_confirmation(session["data"])])
                     continue
                 if value == "retake":
-                    EXPENSE_SESSIONS[user_id] = {"step": "receipt_upload_only", "updated_at": time.time(), "data": session["data"]}
-                    reply_text(reply_token, "請上傳收據或發票照片；系統會直接保存，不重新判讀內容。")
+                    EXPENSE_SESSIONS[user_id] = {"step": "receipt_waiting_image", "updated_at": time.time(), "data": session["data"]}
+                    reply_text(reply_token, "請重新上傳一張完整、清楚且避免反光的收據或發票照片。")
                     continue
                 session["step"], prompt = edit_prompts.get(value, ("quick_edit", "請直接輸入要修改的內容。"))
                 session["edit_field"] = value
@@ -1980,7 +1981,7 @@ async def webhook(request: Request):
                 session["data"]["transactionId"] = uuid.uuid4().hex
                 session["submitting"] = True
                 try:
-                    result = await asyncio.to_thread(submit_expense, session["data"])
+                    result = submit_expense(session["data"])
                 except requests.RequestException:
                     session["submitting"] = False
                     reply_text(reply_token, "目前無法完成重複放行，資料已保留，請稍後再試。")
@@ -2018,32 +2019,20 @@ async def webhook(request: Request):
                 continue
 
             if session and session.get("step") == "supplement_image":
+                start_loading(user_id)
                 try:
-                    result = await asyncio.to_thread(
-                        submit_supplement,
+                    data, _ = process_receipt_image(user_id, receipt_base64, receipt_mime)
+                    result = submit_supplement(
                         user_id, int(session.get("supplement_row") or 0),
                         receiptBase64=receipt_base64, receiptMimeType=receipt_mime,
-                        receiptHash=hashlib.sha256(receipt_base64.encode("ascii")).hexdigest(),
+                        receiptHash=data.get("receiptHash"), companyTaxIdValid=data.get("companyTaxIdValid"),
                         receiptFileName=f"補件_{int(session.get('supplement_row') or 0)}.jpg",
                     )
-                except requests.RequestException:
-                    reply_text(reply_token, "照片保存失敗，請重新上傳一次。")
+                except (ValueError, requests.RequestException):
+                    reply_text(reply_token, "單據辨識或補件更新失敗，請重新拍攝後再試。")
                     continue
                 EXPENSE_SESSIONS.pop(user_id, None)
-                reply_text(reply_token, "照片已保存，補件完成。" if result.get("complete") else "照片已保存；其他待確認資料仍保留在補件清單。")
-                continue
-
-            # 修改資料後補傳照片只保存檔案，不重新執行 OCR 或改寫原本欄位。
-            if session and session.get("step") == "receipt_upload_only":
-                data = session.setdefault("data", {})
-                data["receiptBase64"] = receipt_base64
-                data["receiptMimeType"] = receipt_mime
-                data["receiptHash"] = hashlib.sha256(receipt_base64.encode("ascii")).hexdigest()
-                data["companyTaxIdStatus"] = "pending_manual"
-                data["note"] = (str(data.get("note") or "") + "；補傳照片已保存，未重新辨識內容").strip("；")
-                session["step"] = "quick_confirm"
-                session["updated_at"] = time.time()
-                reply_messages(reply_token, [build_expense_confirmation(data)])
+                reply_text(reply_token, "補件完成。" if result.get("complete") else "照片已更新，仍有其他資料需要補件。")
                 continue
 
             # 第一筆完成後的 15 分鐘內，直接把新單據帶入相同專案。
@@ -2056,7 +2045,7 @@ async def webhook(request: Request):
                 try:
                     start_loading(user_id)
                     EXPENSE_SESSIONS[user_id] = {"step": "receipt_processing", "updated_at": time.time(), "pending_text": "", "data": {"registrantUserId": user_id, "project": batch.get("project", "")}}
-                    data, missing = await asyncio.to_thread(process_receipt_image, user_id, receipt_base64, receipt_mime)
+                    data, missing = process_receipt_image(user_id, receipt_base64, receipt_mime)
                 except ValueError:
                     EXPENSE_SESSIONS.pop(user_id, None)
                     reply_text(reply_token, "這張圖片不像發票或收據，因此沒有啟動代墊登記。")
@@ -2079,7 +2068,7 @@ async def webhook(request: Request):
                     start_loading(user_id)
                     session["step"] = "receipt_processing"
                     session["pending_text"] = ""
-                    data, missing = await asyncio.to_thread(process_receipt_image, user_id, receipt_base64, receipt_mime)
+                    data, missing = process_receipt_image(user_id, receipt_base64, receipt_mime)
                 except ValueError as error:
                     session["step"] = "receipt_waiting_image"
                     reply_text(reply_token, str(error))
@@ -2124,7 +2113,7 @@ async def webhook(request: Request):
                 try:
                     start_loading(user_id)
                     EXPENSE_SESSIONS[user_id] = {"step": "receipt_processing", "updated_at": time.time(), "pending_text": "", "data": {"registrantUserId": user_id}}
-                    data, missing = await asyncio.to_thread(process_receipt_image, user_id, receipt_base64, receipt_mime)
+                    data, missing = process_receipt_image(user_id, receipt_base64, receipt_mime)
                 except ValueError:
                     EXPENSE_SESSIONS.pop(user_id, None)
                     reply_text(reply_token, "這張圖片目前無法確認為代墊單據，請重新拍攝清楚完整的收據或發票。")
@@ -2153,7 +2142,7 @@ async def webhook(request: Request):
                 session["step"] = "receipt_processing"
                 try:
                     start_loading(user_id)
-                    receipt_data, _ = await asyncio.to_thread(process_receipt_image, user_id, receipt_base64, receipt_mime)
+                    receipt_data, _ = process_receipt_image(user_id, receipt_base64, receipt_mime)
                 except (ValueError, requests.RequestException):
                     session["step"] = previous_step
                     reply_text(reply_token, "目前無法辨識單據，原本資料已保留，請重新拍攝後再上傳。")
@@ -2260,6 +2249,9 @@ async def webhook(request: Request):
             if user_id not in INTERNAL_USER_IDS:
                 reply_text(reply_token, "你的帳號尚未加入公司內部登記名單。")
                 continue
+            if EXTERNAL_CASE_TEST_MODE and user_id != EXTERNAL_CASE_OWNER_USER_ID:
+                reply_text(reply_token, "外案功能目前為高爾賢測試模式，尚未開放員工使用。")
+                continue
             employee_name = EXTERNAL_CASE_NAMES.get(user_id) or get_line_profile_name(user_id)
             session = external_case.start(text, user_id, employee_name)
             reply_messages(reply_token, [external_next_message(session)])
@@ -2278,8 +2270,7 @@ async def webhook(request: Request):
                 reply_text(reply_token, "你的帳號尚未加入公司內部登記名單。")
                 continue
             try:
-                data, _ = await asyncio.to_thread(
-                    process_receipt_image,
+                data, _ = process_receipt_image(
                     user_id,
                     pending_receipt["receiptBase64"],
                     pending_receipt["receiptMimeType"],
@@ -2313,8 +2304,7 @@ async def webhook(request: Request):
             session = get_expense_session(user_id)
             if session and session.get("step") == "receipt_waiting_trigger":
                 try:
-                    data, missing = await asyncio.to_thread(
-                        process_receipt_image,
+                    data, missing = process_receipt_image(
                         user_id,
                         session["receiptBase64"],
                         session["receiptMimeType"],

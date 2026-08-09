@@ -130,6 +130,7 @@ QUOTE_USER_ID = "Ub983deb79584603885e5b28e9fdf2d5d"
 
 def test_external_case_approval_owner_is_kao_er_hsien():
     assert main.EXTERNAL_CASE_OWNER_USER_ID == QUOTE_USER_ID
+    assert main.EXTERNAL_CASE_TEST_MODE is True
 
 
 def test_external_case_owner_card_has_confirm_and_discuss_only():
@@ -188,7 +189,7 @@ def test_external_case_five_field_reply_always_advances_to_confirmation():
 
 
 def test_external_case_full_webhook_returns_visible_flex_confirmation(monkeypatch):
-    user_id = "U6c6441cb38102499d1f80d4ea79a53ab"
+    user_id = main.EXTERNAL_CASE_OWNER_USER_ID
     replies = []
     monkeypatch.setattr(main, "verify_signature", lambda raw, signature: True)
     monkeypatch.setattr(main, "reply_messages", lambda token, messages: replies.append((token, messages)))
@@ -255,6 +256,32 @@ def test_external_case_submit_is_reported_saved_even_if_owner_push_fails(monkeyp
     assert asyncio.run(main.webhook(request)) == {"status": "ok"}
     assert "資料已安全保存" in replies[-1]
     assert external_case.get_session(user_id) is None
+
+
+def test_owner_self_submission_replies_with_pending_status_and_approval_card(monkeypatch):
+    user_id = main.EXTERNAL_CASE_OWNER_USER_ID
+    data = external_case.parse_initial("8月10號外案8萬", user_id, "爾賢")
+    data.update({"projectName": "BWS", "caseType": "導演案", "destination": "公司", "paymentDate": "2026-09-15", "contact": "王小姐"})
+    external_case.SESSIONS[user_id] = {"data": data, "step": "confirm", "updatedAt": main.time.time()}
+    replies = []
+    monkeypatch.setattr(main, "verify_signature", lambda raw, signature: True)
+    monkeypatch.setattr(external_case, "api_call", lambda *args, **kwargs: {"ok": True})
+    monkeypatch.setattr(main, "reply_messages", lambda token, messages: replies.append(messages))
+    payload = {"events": [{"type": "postback", "replyToken": "reply-owner", "source": {"type": "user", "userId": user_id}, "postback": {"data": "external:submit"}}]}
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    delivered = False
+
+    async def receive():
+        nonlocal delivered
+        if delivered:
+            return {"type": "http.disconnect"}
+        delivered = True
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    request = Request({"type": "http", "method": "POST", "path": "/webhook", "headers": [(b"x-line-signature", b"test")]}, receive)
+    assert asyncio.run(main.webhook(request)) == {"status": "ok"}
+    assert replies[-1][0]["text"].startswith("已送出，現在是「待核准」")
+    assert [action["label"] for action in replies[-1][1]["template"]["actions"]] == ["確認成立", "待討論"]
 
 
 def all_actions(value):
@@ -772,10 +799,9 @@ def test_crane_expense_is_classified_as_project_expense():
     assert main.infer_category("拍攝現場機具租賃") == "案件支出（餐飲、道具、人員...）"
 
 
-def test_company_tax_id_passes_even_when_ocr_puts_it_in_seller_field():
-    """OCR 誤放欄位時，完整公司統編仍須通過，避免清楚單據被誤報。"""
+def test_seller_tax_id_cannot_pass_company_validation():
     analysis = {"buyerTaxId": "12345678", "sellerTaxId": "90531465"}
-    assert main.has_valid_company_tax_id(analysis) is True
+    assert main.has_valid_company_tax_id(analysis) is False
     analysis["buyerTaxId"] = "9053-1465"
     assert main.has_valid_company_tax_id(analysis) is True
 
