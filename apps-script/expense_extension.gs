@@ -18,9 +18,50 @@ function doPost(e) {
   const body = JSON.parse((e && e.postData && e.postData.contents) || '{}');
   if (['submit', 'approve', 'reject'].includes(body.action)) return handleBonusPost_(body);
   if (body.action === 'expense_diagnostics') return expenseDiagnostics_();
+  if (body.action === 'expense_draft_save') return saveExpenseDraft_(body.userId, body.session);
+  if (body.action === 'expense_draft_get') return getExpenseDraft_(body.userId);
+  if (body.action === 'expense_draft_delete') return deleteExpenseDraft_(body.userId);
   if (body.action === 'expense') return saveExpense_(body.expense || {});
   if (body.action === 'supplement') return updateSupplement_(body.supplement || {});
   return doPostGroup_(e);
+}
+
+function expenseDraftKey_(userId) {
+  return 'expense_draft_' + String(userId || '').replace(/[^0-9A-Za-z_-]/g, '').slice(0, 80);
+}
+
+function saveExpenseDraft_(userId, session) {
+  if (!userId || !session || typeof session !== 'object') return json_({ ok: false, error: 'invalid_draft' });
+  const safeSession = JSON.parse(JSON.stringify(session));
+  if (safeSession.data) {
+    delete safeSession.data.receiptBase64;
+    delete safeSession.data.receiptMimeType;
+  }
+  PropertiesService.getScriptProperties().setProperty(expenseDraftKey_(userId), JSON.stringify(safeSession));
+  return json_({ ok: true });
+}
+
+function getExpenseDraft_(userId) {
+  const properties = PropertiesService.getScriptProperties();
+  const key = expenseDraftKey_(userId);
+  const raw = properties.getProperty(key);
+  if (!raw) return json_({ ok: true, session: null });
+  try {
+    const session = JSON.parse(raw);
+    if (!session.linkExpiresAt || Date.now() / 1000 > Number(session.linkExpiresAt)) {
+      properties.deleteProperty(key);
+      return json_({ ok: true, session: null });
+    }
+    return json_({ ok: true, session: session });
+  } catch (error) {
+    properties.deleteProperty(key);
+    return json_({ ok: true, session: null });
+  }
+}
+
+function deleteExpenseDraft_(userId) {
+  PropertiesService.getScriptProperties().deleteProperty(expenseDraftKey_(userId));
+  return json_({ ok: true });
 }
 
 function expenseDiagnostics_() {
