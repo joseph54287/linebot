@@ -21,7 +21,6 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 APP_RELEASE = "2026-08-09-expense-v13"
-import external_case
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 GROUP_REGISTRY_URL = os.environ.get("GROUP_REGISTRY_URL", "").rstrip("/")
@@ -32,13 +31,22 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 RECEIPT_VISION_MODEL = os.environ.get("RECEIPT_VISION_MODEL", "gemini-3.6-flash")
 PROJECT_API_URL = os.environ.get("PROJECT_API_URL", "").rstrip("/")
 PROJECT_API_KEY = os.environ.get("PROJECT_API_KEY", "")
-BONUS_API_URL = os.environ.get("BONUS_API_URL", "").rstrip("/")
-BONUS_API_KEY = os.environ.get("BONUS_API_KEY", "")
 QUOTE_WEBHOOK_URL = os.environ.get(
     "QUOTE_WEBHOOK_URL",
     "https://linebot-bam2.onrender.com/webhook",
 ).rstrip("/")
 QUOTE_OWNER_USER_ID = "Ub983deb79584603885e5b28e9fdf2d5d"
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN", "")
+CALENDAR_IDS = tuple(
+    calendar_id.strip()
+    for calendar_id in os.environ.get(
+        "CALENDAR_IDS",
+        "contact@goalbrother.com,aurtorfilm@gmail.com",
+    ).split(",")
+    if calendar_id.strip()
+)
 OWNER_USER_ID = os.environ.get(
     "OWNER_USER_ID",
     "U6c6441cb38102499d1f80d4ea79a53ab",
@@ -108,12 +116,6 @@ INTERNAL_USER_NAMES = {
     "Ub983deb79584603885e5b28e9fdf2d5d": "高爾賢",
     "U9478b00702c716685d9d8b021d62d538": "阿全",
 }
-# 獎金表使用的正式姓名必須與 COUNTIF 關鍵字完全一致。
-EXTERNAL_CASE_NAMES = {
-    "U6c6441cb38102499d1f80d4ea79a53ab": "周暐",
-    "Ub983deb79584603885e5b28e9fdf2d5d": "爾賢",
-    "U9478b00702c716685d9d8b021d62d538": "阿筌",
-}
 
 CATEGORY_KEYWORDS = {
     "案件支出（餐飲、道具、人員...）": [
@@ -175,6 +177,19 @@ def is_quote_event(event: dict[str, Any]) -> bool:
         text = message.get("text", "").strip()
         return text in {"確認", "送出"} or text.startswith("主旨：")
     return False
+
+
+def is_calendar_command(event: dict[str, Any]) -> bool:
+    """只允許三位內部成員在 Bot 個人聊天室使用精確關鍵字「行程」。"""
+    source = event.get("source", {})
+    message = event.get("message", {})
+    return (
+        event.get("type") == "message"
+        and source.get("type") == "user"
+        and source.get("userId") in INTERNAL_USER_IDS
+        and message.get("type") == "text"
+        and message.get("text", "").strip() == "行程"
+    )
 
 
 def forward_quote_webhook(body: bytes, signature: str) -> bool:
@@ -282,6 +297,140 @@ def reply_text(reply_token: str, text: str) -> None:
     reply_messages(reply_token, [{"type": "text", "text": text}])
 
 
+def google_access_token() -> str:
+    """以 Render Secret 中的 refresh token 取得短效 Google access token。"""
+    if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN):
+        raise requests.RequestException("Google Calendar OAuth 尚未設定")
+    response = requests.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "refresh_token": GOOGLE_REFRESH_TOKEN,
+            "grant_type": "refresh_token",
+        },
+        timeout=10,
+    )
+    response.raise_for_status()
+    token = response.json().get("access_token", "")
+    if not token:
+        raise requests.RequestException("Google OAuth 未回傳 access token")
+    return token
+
+
+def fetch_calendar_events(start: datetime, end: datetime) -> list[dict[str, Any]]:
+    """合併指定兩本 Google Calendar，並去除完全相同的事件。"""
+    token = google_access_token()
+    events: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for calendar_id in CALENDAR_IDS:
+        response = requests.get(
+            f"https://www.googleapis.com/calendar/v3/calendars/{requests.utils.quote(calendar_id, safe='')}/events",
+            headers={"Authorization": f"Bearer {token}"},
+            params={
+                "timeMin": start.isoformat(),
+                "timeMax": end.isoformat(),
+                "singleEvents": "true",
+                "orderBy": "startTime",
+                "timeZone": "Asia/Taipei",
+            },
+            timeout=15,
+        )
+        response.raise_for_status()
+        for item in response.json().get("items", []):
+            if item.get("status") == "cancelled":
+                continue
+            event_start = item.get("start", {}).get("dateTime") or item.get("start", {}).get("date", "")
+            event_end = item.get("end", {}).get("dateTime") or item.get("end", {}).get("date", "")
+            key = (
+                item.get("summary", "未命名行程"),
+                event_start,
+                event_end,
+                item.get("location", ""),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            events.append(item)
+
+    def sort_key(item: dict[str, Any]) -> str:
+        return item.get("start", {}).get("dateTime") or item.get("start", {}).get("date", "")
+
+    return sorted(events, key=sort_key)
+
+
+def calendar_event_time(item: dict[str, Any]) -> str:
+    """將 Google Calendar 起訖時間轉為台北時間。"""
+    start_data = item.get("start", {})
+    if start_data.get("date"):
+        return "全天"
+    try:
+        start = datetime.fromisoformat(start_data["dateTime"].replace("Z", "+00:00")).astimezone(TAIPEI_TZ)
+        end = datetime.fromisoformat(item["end"]["dateTime"].replace("Z", "+00:00")).astimezone(TAIPEI_TZ)
+    except (KeyError, ValueError):
+        return "時間待確認"
+    return f"{start:%H:%M}–{end:%H:%M}"
+
+
+def calendar_day_card(label: str, day: datetime, events: list[dict[str, Any]]) -> dict[str, Any]:
+    """建立單日藍色 LINE 行程圖卡。"""
+    rows: list[dict[str, Any]] = []
+    for item in events[:12]:
+        details = calendar_event_time(item)
+        if item.get("location"):
+            details += f"｜{item['location']}"
+        row_contents: list[dict[str, Any]] = [
+            {"type": "text", "text": item.get("summary") or "未命名行程", "weight": "bold", "size": "sm", "wrap": True},
+            {"type": "text", "text": details, "size": "xs", "color": "#64748B", "wrap": True, "margin": "xs"},
+        ]
+        link = item.get("hangoutLink") or item.get("htmlLink")
+        row: dict[str, Any] = {
+            "type": "box", "layout": "vertical", "margin": "md", "paddingAll": "12px",
+            "backgroundColor": "#EFF6FF", "cornerRadius": "12px", "contents": row_contents,
+        }
+        if link:
+            row["action"] = {"type": "uri", "label": "開啟行程", "uri": link}
+        rows.append(row)
+    if not rows:
+        rows.append({"type": "text", "text": "沒有行程", "align": "center", "color": "#64748B", "margin": "xl"})
+    elif len(events) > 12:
+        rows.append({"type": "text", "text": f"另有 {len(events) - 12} 項行程，請至 Google Calendar 查看", "size": "xs", "color": "#64748B", "wrap": True, "margin": "md"})
+
+    return {
+        "type": "bubble",
+        "size": "mega",
+        "header": {
+            "type": "box", "layout": "vertical", "backgroundColor": "#2563EB", "paddingAll": "20px",
+            "contents": [
+                {"type": "text", "text": label, "color": "#FFFFFF", "weight": "bold", "size": "xl"},
+                {"type": "text", "text": day.strftime("%Y/%m/%d"), "color": "#DBEAFE", "size": "sm", "margin": "sm"},
+            ],
+        },
+        "body": {"type": "box", "layout": "vertical", "paddingAll": "16px", "contents": rows},
+    }
+
+
+def calendar_command_message(now: datetime | None = None) -> dict[str, Any]:
+    """查詢今日與明日後，回傳可左右滑動的兩張圖卡。"""
+    current = (now or datetime.now(TAIPEI_TZ)).astimezone(TAIPEI_TZ)
+    today = current.replace(hour=0, minute=0, second=0, microsecond=0)
+    tomorrow = today + timedelta(days=1)
+    day_after = tomorrow + timedelta(days=1)
+    today_events = fetch_calendar_events(today, tomorrow)
+    tomorrow_events = fetch_calendar_events(tomorrow, day_after)
+    return {
+        "type": "flex",
+        "altText": "今日與明日行程",
+        "contents": {
+            "type": "carousel",
+            "contents": [
+                calendar_day_card("今日行程", today, today_events),
+                calendar_day_card("明日行程", tomorrow, tomorrow_events),
+            ],
+        },
+    }
+
+
 def start_loading(user_id: str, seconds: int = 60) -> None:
     """在一對一聊天室顯示 LINE 原生處理動畫；失敗不阻斷主流程。"""
     if not user_id:
@@ -296,12 +445,6 @@ def start_loading(user_id: str, seconds: int = 60) -> None:
         response.raise_for_status()
     except requests.RequestException:
         LOGGER.warning("無法顯示 LINE 載入動畫")
-
-
-def external_next_message(session: dict[str, Any]) -> dict[str, Any]:
-    if session["step"] == "confirm":
-        return external_case.confirmation_card(session["data"])
-    return external_case.prompt(session["step"])
 
 
 def option_card(title: str, options: list[str], field: str) -> dict[str, Any]:
@@ -1405,61 +1548,6 @@ async def webhook(request: Request):
         CURRENT_LINE_SOURCE_TYPE.set(str(source.get("type") or ""))
         CURRENT_WEBHOOK_EVENT_ID.set(event_id)
 
-        # 外案申請獨立於代墊流程：員工送出後先待主管核准，核准成功才寫入獎金表。
-        if event.get("type") == "postback" and source.get("type") == "user":
-            raw_external = event.get("postback", {}).get("data", "")
-            if raw_external.startswith("external:"):
-                parts = raw_external.split(":", 3)
-                action = parts[1] if len(parts) > 1 else ""
-                if action == "cancel":
-                    external_case.SESSIONS.pop(user_id, None)
-                    reply_text(reply_token, "好，這筆外案先不送出。")
-                    continue
-                if action == "set" and len(parts) == 4:
-                    session = external_case.accept_option(user_id, parts[2], parts[3])
-                    if not session:
-                        reply_text(reply_token, "這筆外案已逾時，請重新輸入「外案」。")
-                    else:
-                        reply_messages(reply_token, [external_next_message(session)])
-                    continue
-                if action == "submit":
-                    session = external_case.get_session(user_id)
-                    if not session or session["step"] != "confirm":
-                        reply_text(reply_token, "資料還沒完整，請重新輸入「外案」。")
-                        continue
-                    try:
-                        external_case.api_call(BONUS_API_URL, BONUS_API_KEY, {"action": "submit", "data": session["data"]})
-                        push_messages(OWNER_USER_ID, [external_case.approval_card(session["data"])])
-                    except requests.RequestException:
-                        reply_text(reply_token, "目前無法送出核准，內容還在，請稍後再按一次。")
-                        continue
-                    external_case.SESSIONS.pop(user_id, None)
-                    reply_text(reply_token, "已送出，現在是「待核准」。\n有結果我會通知你。")
-                    continue
-                if action in {"approve", "reject"} and len(parts) >= 3:
-                    if user_id != OWNER_USER_ID:
-                        reply_text(reply_token, "這個操作只有核准人可以執行。")
-                        continue
-                    request_id = parts[2]
-                    try:
-                        result = external_case.api_call(BONUS_API_URL, BONUS_API_KEY, {
-                            "action": action, "requestId": request_id, "approverUserId": user_id,
-                        })
-                    except requests.RequestException:
-                        reply_text(reply_token, "目前無法完成處理，這筆尚未登記，請稍後再試。")
-                        continue
-                    applicant_id = str(result.get("employeeUserId") or "")
-                    project_name = str(result.get("projectName") or "這筆外案")
-                    if action == "approve":
-                        reply_text(reply_token, "已核准，並完成登記。")
-                        if applicant_id:
-                            push_messages(applicant_id, [{"type": "text", "text": f"你的外案「{project_name}」已經核准，並完成登記。"}])
-                    else:
-                        reply_text(reply_token, "已拒絕這筆外案。")
-                        if applicant_id:
-                            push_messages(applicant_id, [{"type": "text", "text": f"你的外案「{project_name}」沒有通過。"}])
-                    continue
-
         # 代墊登記只允許已登記成員在 Bot 個人聊天室操作。
         if event.get("type") == "postback" and source.get("type") == "user":
             if user_id not in INTERNAL_USER_IDS:
@@ -1793,6 +1881,15 @@ async def webhook(request: Request):
         text = message.get("text", "").strip()
         command = text.casefold()
 
+        # 三位內部成員在 Bot 個人聊天室輸入精確關鍵字「行程」時，讀取今日與明日。
+        if is_calendar_command(event):
+            try:
+                start_loading(user_id)
+                reply_messages(reply_token, [calendar_command_message()])
+            except requests.RequestException:
+                reply_text(reply_token, "目前無法完整讀取 Google Calendar，請稍後再試；本次沒有將資料顯示為無行程。")
+            continue
+
         session = get_expense_session(user_id) if source.get("type") == "user" else None
         if session and session.get("step") in {"supplement_project", "supplement_amount"}:
             try:
@@ -1824,22 +1921,6 @@ async def webhook(request: Request):
                 reply_messages(reply_token, [expense_stats_card(stats)])
             except requests.RequestException:
                 reply_text(reply_token, "目前無法讀取代墊統計，請稍後再試；本次沒有建立代墊紀錄。")
-            continue
-
-        # 「8月10號外案 1萬」可直接帶入日期、金額，再一次詢問其餘資料。
-        if source.get("type") == "user" and external_case.is_external_case_text(text):
-            if user_id not in INTERNAL_USER_IDS:
-                reply_text(reply_token, "你的帳號尚未加入公司內部登記名單。")
-                continue
-            employee_name = EXTERNAL_CASE_NAMES.get(user_id) or get_line_profile_name(user_id)
-            session = external_case.start(text, user_id, employee_name)
-            reply_messages(reply_token, [external_next_message(session)])
-            continue
-
-        external_session = external_case.get_session(user_id) if source.get("type") == "user" else None
-        if external_session and external_session.get("step") != "confirm":
-            session = external_case.accept_text(user_id, text)
-            reply_messages(reply_token, [external_next_message(session)])
             continue
 
         # 圖片後直接輸入「代墊 PJR 專案」時，同時啟動 OCR 並累積本句資料。
@@ -2028,6 +2109,9 @@ async def health():
         "expense_configured": bool(EXPENSE_API_URL and EXPENSE_API_KEY),
         "receipt_vision_configured": bool(GEMINI_API_KEY),
         "quote_webhook_configured": bool(QUOTE_WEBHOOK_URL),
+        "calendar_configured": bool(
+            GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN and CALENDAR_IDS
+        ),
         "internal_user_count": len(INTERNAL_USER_IDS),
         "owner_configured": bool(OWNER_USER_ID),
     }
