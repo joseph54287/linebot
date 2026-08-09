@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import asyncio
 import hashlib
 import hmac
 import logging
@@ -1756,14 +1757,15 @@ async def webhook(request: Request):
                     continue
                 if action == "select":
                     try:
-                        item = next(item for item in get_supplements(user_id) if int(item.get("row") or 0) == row)
+                        supplements = await asyncio.to_thread(get_supplements, user_id)
+                        item = next(item for item in supplements if int(item.get("row") or 0) == row)
                         reply_messages(reply_token, [supplement_detail_card(item)])
                     except (requests.RequestException, StopIteration):
                         reply_text(reply_token, "這筆資料已完成或目前無法讀取，請重新輸入「我的待補件」。")
                     continue
                 if action == "accept_no_tax":
                     try:
-                        result = submit_supplement(user_id, row, acceptNoTax=True)
+                        result = await asyncio.to_thread(submit_supplement, user_id, row, acceptNoTax=True)
                         reply_text(reply_token, "已記錄為維持無統編。" if result.get("complete") else "已更新，仍有其他資料需要補件。")
                     except requests.RequestException:
                         reply_text(reply_token, "補件更新失敗，請稍後再試。")
@@ -1806,7 +1808,7 @@ async def webhook(request: Request):
                 continue
             if raw_data == "expense:supplements":
                 try:
-                    reply_messages(reply_token, [supplement_list_card(get_supplements(user_id))])
+                    reply_messages(reply_token, [supplement_list_card(await asyncio.to_thread(get_supplements, user_id))])
                 except requests.RequestException:
                     reply_text(reply_token, "目前無法讀取待補件資料，請稍後再試。")
                 continue
@@ -1816,7 +1818,7 @@ async def webhook(request: Request):
                     reply_text(reply_token, "請輸入要查詢的專案名稱，例如：PJR。")
                 else:
                     try:
-                        reply_messages(reply_token, [expense_stats_card(get_expense_stats(user_id))])
+                        reply_messages(reply_token, [expense_stats_card(await asyncio.to_thread(get_expense_stats, user_id))])
                     except requests.RequestException:
                         reply_text(reply_token, "目前無法讀取代墊明細，請稍後再試。")
                 continue
@@ -1881,7 +1883,7 @@ async def webhook(request: Request):
                 session["continuous"] = action == "confirm_continuous"
                 try:
                     session["data"]["registrantName"] = get_line_profile_name(user_id)
-                    result = submit_expense(session["data"])
+                    result = await asyncio.to_thread(submit_expense, session["data"])
                 except requests.RequestException as error:
                     session["submitting"] = False
                     error_code = str(error) or "unknown"
@@ -1948,7 +1950,7 @@ async def webhook(request: Request):
                 session["data"]["transactionId"] = uuid.uuid4().hex
                 session["submitting"] = True
                 try:
-                    result = submit_expense(session["data"])
+                    result = await asyncio.to_thread(submit_expense, session["data"])
                 except requests.RequestException:
                     session["submitting"] = False
                     reply_text(reply_token, "目前無法完成重複放行，資料已保留，請稍後再試。")
@@ -1988,8 +1990,9 @@ async def webhook(request: Request):
             if session and session.get("step") == "supplement_image":
                 start_loading(user_id)
                 try:
-                    data, _ = process_receipt_image(user_id, receipt_base64, receipt_mime)
-                    result = submit_supplement(
+                    data, _ = await asyncio.to_thread(process_receipt_image, user_id, receipt_base64, receipt_mime)
+                    result = await asyncio.to_thread(
+                        submit_supplement,
                         user_id, int(session.get("supplement_row") or 0),
                         receiptBase64=receipt_base64, receiptMimeType=receipt_mime,
                         receiptHash=data.get("receiptHash"), companyTaxIdValid=data.get("companyTaxIdValid"),
@@ -2012,7 +2015,7 @@ async def webhook(request: Request):
                 try:
                     start_loading(user_id)
                     EXPENSE_SESSIONS[user_id] = {"step": "receipt_processing", "updated_at": time.time(), "pending_text": "", "data": {"registrantUserId": user_id, "project": batch.get("project", "")}}
-                    data, missing = process_receipt_image(user_id, receipt_base64, receipt_mime)
+                    data, missing = await asyncio.to_thread(process_receipt_image, user_id, receipt_base64, receipt_mime)
                 except ValueError:
                     EXPENSE_SESSIONS.pop(user_id, None)
                     reply_text(reply_token, "這張圖片不像發票或收據，因此沒有啟動代墊登記。")
@@ -2035,7 +2038,7 @@ async def webhook(request: Request):
                     start_loading(user_id)
                     session["step"] = "receipt_processing"
                     session["pending_text"] = ""
-                    data, missing = process_receipt_image(user_id, receipt_base64, receipt_mime)
+                    data, missing = await asyncio.to_thread(process_receipt_image, user_id, receipt_base64, receipt_mime)
                 except ValueError as error:
                     session["step"] = "receipt_waiting_image"
                     reply_text(reply_token, str(error))
@@ -2080,7 +2083,7 @@ async def webhook(request: Request):
                 try:
                     start_loading(user_id)
                     EXPENSE_SESSIONS[user_id] = {"step": "receipt_processing", "updated_at": time.time(), "pending_text": "", "data": {"registrantUserId": user_id}}
-                    data, missing = process_receipt_image(user_id, receipt_base64, receipt_mime)
+                    data, missing = await asyncio.to_thread(process_receipt_image, user_id, receipt_base64, receipt_mime)
                 except ValueError:
                     EXPENSE_SESSIONS.pop(user_id, None)
                     reply_text(reply_token, "這張圖片目前無法確認為代墊單據，請重新拍攝清楚完整的收據或發票。")
@@ -2109,7 +2112,7 @@ async def webhook(request: Request):
                 session["step"] = "receipt_processing"
                 try:
                     start_loading(user_id)
-                    receipt_data, _ = process_receipt_image(user_id, receipt_base64, receipt_mime)
+                    receipt_data, _ = await asyncio.to_thread(process_receipt_image, user_id, receipt_base64, receipt_mime)
                 except (ValueError, requests.RequestException):
                     session["step"] = previous_step
                     reply_text(reply_token, "目前無法辨識單據，原本資料已保留，請重新拍攝後再上傳。")
@@ -2151,7 +2154,7 @@ async def webhook(request: Request):
             continue
         if session and session.get("step") == "stats_project":
             try:
-                stats = get_expense_stats(user_id)
+                stats = await asyncio.to_thread(get_expense_stats, user_id)
                 stats["projects"] = [item for item in stats.get("projects", []) if text.casefold() in str(item.get("project", "")).casefold()]
                 reply_messages(reply_token, [expense_stats_card(stats)])
             except requests.RequestException:
@@ -2182,12 +2185,12 @@ async def webhook(request: Request):
         if session and session.get("step") in {"supplement_project", "supplement_amount"}:
             try:
                 if session["step"] == "supplement_project":
-                    result = submit_supplement(user_id, int(session["supplement_row"]), project=text)
+                    result = await asyncio.to_thread(submit_supplement, user_id, int(session["supplement_row"]), project=text)
                 else:
                     amount = float(text.replace(",", "").replace("$", ""))
                     if amount <= 0:
                         raise ValueError
-                    result = submit_supplement(user_id, int(session["supplement_row"]), amount=amount)
+                    result = await asyncio.to_thread(submit_supplement, user_id, int(session["supplement_row"]), amount=amount)
             except (ValueError, requests.RequestException):
                 reply_text(reply_token, "補件內容格式不正確或更新失敗，請重新輸入。")
                 continue
@@ -2197,7 +2200,7 @@ async def webhook(request: Request):
 
         if source.get("type") == "user" and user_id in INTERNAL_USER_IDS and looks_like_supplement_query(text):
             try:
-                reply_messages(reply_token, [supplement_list_card(get_supplements(user_id))])
+                reply_messages(reply_token, [supplement_list_card(await asyncio.to_thread(get_supplements, user_id))])
             except requests.RequestException:
                 reply_text(reply_token, "目前無法讀取待補件資料，請稍後再試。")
             continue
@@ -2205,7 +2208,7 @@ async def webhook(request: Request):
         # 查詢意圖優先於「代墊」關鍵字，絕不建立或修改登記暫存。
         if source.get("type") == "user" and user_id in INTERNAL_USER_IDS and looks_like_expense_query(text):
             try:
-                stats = get_expense_stats(user_id)
+                stats = await asyncio.to_thread(get_expense_stats, user_id)
                 reply_messages(reply_token, [expense_stats_card(stats)])
             except requests.RequestException:
                 reply_text(reply_token, "目前無法讀取代墊統計，請稍後再試；本次沒有建立代墊紀錄。")
@@ -2234,7 +2237,8 @@ async def webhook(request: Request):
                 reply_text(reply_token, "你的帳號尚未加入公司內部登記名單。")
                 continue
             try:
-                data, _ = process_receipt_image(
+                data, _ = await asyncio.to_thread(
+                    process_receipt_image,
                     user_id,
                     pending_receipt["receiptBase64"],
                     pending_receipt["receiptMimeType"],
@@ -2268,7 +2272,8 @@ async def webhook(request: Request):
             session = get_expense_session(user_id)
             if session and session.get("step") == "receipt_waiting_trigger":
                 try:
-                    data, missing = process_receipt_image(
+                    data, missing = await asyncio.to_thread(
+                        process_receipt_image,
                         user_id,
                         session["receiptBase64"],
                         session["receiptMimeType"],
