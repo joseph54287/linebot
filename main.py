@@ -56,6 +56,7 @@ OWNER_USER_ID = os.environ.get(
 )
 # 外案最終核准人固定為高爾賢的 LINE 帳號；避免其他系統的 OWNER_USER_ID 誤導核准通知。
 EXTERNAL_CASE_OWNER_USER_ID = "Ub983deb79584603885e5b28e9fdf2d5d"
+EXTERNAL_CASE_TEST_MODE = True
 DEFAULT_INTERNAL_USER_IDS = (
     "U6c6441cb38102499d1f80d4ea79a53ab,"
     "Ub983deb79584603885e5b28e9fdf2d5d,"
@@ -2223,6 +2224,9 @@ async def webhook(request: Request):
         if source.get("type") == "user" and external_case.is_external_case_text(text):
             if user_id not in INTERNAL_USER_IDS:
                 reply_text(reply_token, "你的帳號尚未加入公司內部登記名單。")
+                continue
+            if EXTERNAL_CASE_TEST_MODE and user_id != EXTERNAL_CASE_OWNER_USER_ID:
+                reply_text(reply_token, "外案功能目前為高爾賢測試模式，尚未開放員工使用。")
                 continue
             employee_name = EXTERNAL_CASE_NAMES.get(user_id) or get_line_profile_name(user_id)
             session = external_case.start(text, user_id, employee_name)
