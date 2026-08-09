@@ -20,6 +20,10 @@ services:
         sync: false
       - key: EXPENSE_API_KEY
         sync: false
+      - key: BONUS_API_URL
+        sync: false
+      - key: BONUS_API_KEY
+        sync: false
       - key: GEMINI_API_KEY
         sync: false
       - key: RECEIPT_VISION_MODEL

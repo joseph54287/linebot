@@ -16,6 +16,7 @@ function doGet(e) {
 function doPost(e) {
   if (!authorized_(e)) return json_({ ok: false, error: 'unauthorized' });
   const body = JSON.parse((e && e.postData && e.postData.contents) || '{}');
+  if (['submit', 'approve', 'reject'].includes(body.action)) return handleBonusPost_(body);
   if (body.action === 'expense_diagnostics') return expenseDiagnostics_();
   if (body.action === 'expense') return saveExpense_(body.expense || {});
   if (body.action === 'supplement') return updateSupplement_(body.supplement || {});
