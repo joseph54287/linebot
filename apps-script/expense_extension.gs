@@ -16,9 +16,29 @@ function doGet(e) {
 function doPost(e) {
   if (!authorized_(e)) return json_({ ok: false, error: 'unauthorized' });
   const body = JSON.parse((e && e.postData && e.postData.contents) || '{}');
+  if (body.action === 'expense_diagnostics') return expenseDiagnostics_();
   if (body.action === 'expense') return saveExpense_(body.expense || {});
   if (body.action === 'supplement') return updateSupplement_(body.supplement || {});
   return doPostGroup_(e);
+}
+
+function expenseDiagnostics_() {
+  try {
+    const sheet = SpreadsheetApp.openById(EXPENSE_SHEET_ID_).getSheetByName(EXPENSE_SHEET_NAME_);
+    if (!sheet) return json_({ ok: false, error: 'expense_sheet_not_found' });
+    ensureExpenseMetadataHeaders_(sheet);
+    const folder = DriveApp.getFolderById(EXPENSE_RECEIPT_FOLDER_ID_);
+    return json_({ ok: true, sheetColumns: sheet.getMaxColumns(), folderAccessible: Boolean(folder.getId()) });
+  } catch (error) {
+    return json_({ ok: false, error: 'diagnostics_failed', detail: String(error && error.message || error).slice(0, 200) });
+  }
+}
+
+// 僅供專案擁有者在 Apps Script 編輯器執行，用來完成 Drive OAuth 授權。
+function authorizeExpenseDrive() {
+  const sheet = SpreadsheetApp.openById(EXPENSE_SHEET_ID_).getSheetByName(EXPENSE_SHEET_NAME_);
+  const folder = DriveApp.getFolderById(EXPENSE_RECEIPT_FOLDER_ID_);
+  return { sheet: sheet.getName(), folder: folder.getName() };
 }
 
 function saveExpense_(expense) {
