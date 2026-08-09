@@ -125,7 +125,8 @@ def prompt(step: str) -> dict[str, Any]:
         return {"type": "text", "text": texts[step]}
     if step == "details":
         return {"type": "text", "text": (
-            "日期和金額收到，再一次補這 4 項就好：\n"
+            "金額收到。\n\n"
+            "請再補這 4 項：\n"
             "案名：＿＿＿\n"
             "案型：導演案／剪接案／製片案／其他\n"
             "款項：公司／員工個人／尚未確認\n"
@@ -184,10 +185,9 @@ def confirmation_card(data: dict[str, Any]) -> dict[str, Any]:
         f"預計匯款：{data['paymentDate']}",
         f"你應得：{money(employee_share)}", f"公司應得：{money(company_share)}",
     ])
-    return {"type": "template", "altText": "確認外案申請", "template": {
-        "type": "buttons", "title": "確認外案申請", "text": summary[:160], "actions": [
-            {"type": "postback", "label": "送出核准", "data": "external:submit", "displayText": "送出核准"},
-            {"type": "postback", "label": "取消", "data": "external:cancel", "displayText": "取消外案申請"},
+    return {"type": "template", "altText": "請最後確認外案資料", "template": {
+        "type": "buttons", "title": "最後確認", "text": summary[:160], "actions": [
+            {"type": "postback", "label": "確認送出", "data": "external:submit", "displayText": "確認送出"},
         ],
     }}
 

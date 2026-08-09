@@ -98,6 +98,20 @@ def test_external_case_ten_wan_never_reprompts_for_amount():
         assert external_case.next_step(data) == "details"
 
 
+def test_external_case_uses_two_step_prompt_and_one_final_confirmation():
+    detail_prompt = external_case.prompt("details")
+    assert detail_prompt["text"].startswith("金額收到。")
+    assert "請再補這 4 項" in detail_prompt["text"]
+    data = external_case.parse_initial("8月10號外案8萬", "U-test", "爾賢")
+    data.update({
+        "projectName": "測試專案", "caseType": "導演案", "destination": "公司",
+        "paymentDate": "2026-09-15",
+    })
+    card = external_case.confirmation_card(data)
+    actions = card["template"]["actions"]
+    assert actions == [{"type": "postback", "label": "確認送出", "data": "external:submit", "displayText": "確認送出"}]
+
+
 def all_actions(value):
     """遞迴收集 Flex 圖卡操作，避免測試綁死視覺排版位置。"""
     found = []
