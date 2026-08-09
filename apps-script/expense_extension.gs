@@ -154,6 +154,11 @@ function expenseStats_(payer, userId) {
 
 function ensureExpenseMetadataHeaders_(sheet) {
   const headers = ['交易識別碼', '發票號碼', '統編狀態', 'LINE User ID', '圖片指紋', '補件狀態', '缺漏原因', '最後補件時間', '補件完成時間', '商家名稱', '單據語意指紋', '重複放行原資料列', '重複放行人', '重複放行時間'];
+  const requiredLastColumn = 15 + headers.length;
+  // 表單回應表預設可能只有 26 欄，先擴充後再寫入第 29 欄。
+  if (sheet.getMaxColumns() < requiredLastColumn) {
+    sheet.insertColumnsAfter(sheet.getMaxColumns(), requiredLastColumn - sheet.getMaxColumns());
+  }
   const range = sheet.getRange(1, 16, 1, headers.length);
   const current = range.getValues()[0];
   range.setValues([headers.map(function(header, index) { return current[index] || header; })]);
