@@ -23,7 +23,7 @@ function handleBonusPost_(payload) {
 }
 
 function bonusLog_(spreadsheet) {
-  const headers = ['申請編號','狀態','員工','LINE User ID','日期','案名','未稅金額','案型','款項匯入','申請時間','核准人','處理時間','專案列','預計匯款日期','計價方式','稅額','含稅收款'];
+  const headers = ['申請編號','狀態','員工','LINE User ID','日期','案名','未稅金額','案型','款項匯入','申請時間','核准人','處理時間','專案列','預計匯款日期','計價方式','稅額','含稅收款','聯繫窗口'];
   let sheet = spreadsheet.getSheetByName(BONUS_LOG_SHEET);
   if (!sheet) {
     sheet = spreadsheet.insertSheet(BONUS_LOG_SHEET);
@@ -34,7 +34,7 @@ function bonusLog_(spreadsheet) {
 }
 
 function bonusSubmit_(spreadsheet, data) {
-  const required = ['requestId','employeeName','employeeUserId','date','projectName','amount','caseType','destination','paymentDate'];
+  const required = ['requestId','employeeName','employeeUserId','date','projectName','amount','caseType','destination','paymentDate','contact'];
   if (required.some(key => data[key] === '' || data[key] === null || data[key] === undefined)) return {ok:false,error:'Missing fields'};
   const amount = Number(data.amount);
   if (!Number.isFinite(amount) || amount <= 0) return {ok:false,error:'Invalid amount'};
@@ -45,7 +45,7 @@ function bonusSubmit_(spreadsheet, data) {
   const taxMode = data.taxMode === '含稅' ? '含稅' : '稅外';
   const grossAmount = taxMode === '含稅' ? Number(data.enteredAmount) : Math.round(amount * 1.05);
   const taxAmount = grossAmount - amount;
-  sheet.appendRow([data.requestId,'待核准',data.employeeName,data.employeeUserId,new Date(data.date),data.projectName,amount,data.caseType,data.destination,new Date(),'','','',new Date(data.paymentDate),taxMode,taxAmount,grossAmount]);
+  sheet.appendRow([data.requestId,'待核准',data.employeeName,data.employeeUserId,new Date(data.date),data.projectName,amount,data.caseType,data.destination,new Date(),'','','',new Date(data.paymentDate),taxMode,taxAmount,grossAmount,data.contact]);
   return {ok:true,requestId:data.requestId};
 }
 
@@ -54,7 +54,7 @@ function bonusResolve_(spreadsheet, payload, approved) {
   const found = sheet.getRange('A:A').createTextFinder(String(payload.requestId || '')).matchEntireCell(true).findNext();
   if (!found) return {ok:false,error:'Not found'};
   const row = found.getRow();
-  const values = sheet.getRange(row,1,1,17).getValues()[0];
+  const values = sheet.getRange(row,1,1,18).getValues()[0];
   const status = values[1];
   const result = {ok:true,employeeName:values[2],employeeUserId:values[3],projectName:values[5]};
   if (status === '已核准' || status === '已拒絕') return Object.assign(result,{duplicate:true,status:status});
@@ -67,7 +67,7 @@ function bonusResolve_(spreadsheet, payload, approved) {
   const projectRow = bonusInsertProject_(spreadsheet, {
     requestId:values[0], employeeName:values[2], date:values[4], projectName:values[5],
     amount:Number(values[6]), caseType:values[7], destination:values[8], approverUserId:payload.approverUserId || '',
-    paymentDate:values[13], taxMode:values[14], taxAmount:Number(values[15]), grossAmount:Number(values[16]),
+    paymentDate:values[13], taxMode:values[14], taxAmount:Number(values[15]), grossAmount:Number(values[16]), contact:values[17],
   });
   sheet.getRange(row,2).setValue('已核准');
   sheet.getRange(row,11,1,3).setValues([[payload.approverUserId || '',new Date(),projectRow]]);
@@ -77,7 +77,7 @@ function bonusResolve_(spreadsheet, payload, approved) {
 function bonusInsertProject_(spreadsheet, data) {
   const sheet = spreadsheet.getSheetByName(BONUS_PROJECT_SHEET);
   if (!sheet) throw new Error('Project sheet not found');
-  const headers = ['案型','外案申請編號','外案狀態','LINE申請人','核准人','申請核准時間','來源','預計匯款日期','計價方式','稅額','含稅收款'];
+  const headers = ['案型','外案申請編號','外案狀態','LINE申請人','核准人','申請核准時間','來源','預計匯款日期','計價方式','稅額','含稅收款','聯繫窗口'];
   if (!sheet.getRange(1,13).getValue()) sheet.getRange(1,13,1,headers.length).setValues([headers]);
   const existing = sheet.getRange('N:N').createTextFinder(String(data.requestId)).matchEntireCell(true).findNext();
   if (existing) return existing.getRow();
@@ -103,6 +103,7 @@ function bonusInsertProject_(spreadsheet, data) {
   sheet.getRange(target,13,1,7).setValues([[data.caseType,data.requestId,'已核准',data.employeeName,data.approverUserId,new Date(),'LINE Bot']]);
   sheet.getRange(target,20).setValue(data.paymentDate);
   sheet.getRange(target,21,1,3).setValues([[data.taxMode,data.taxAmount,data.grossAmount]]);
+  sheet.getRange(target,24).setValue(data.contact);
   return target;
 }
 
