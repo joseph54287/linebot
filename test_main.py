@@ -742,9 +742,10 @@ def test_crane_expense_is_classified_as_project_expense():
     assert main.infer_category("拍攝現場機具租賃") == "案件支出（餐飲、道具、人員...）"
 
 
-def test_seller_tax_id_cannot_pass_company_validation():
+def test_company_tax_id_passes_even_when_ocr_puts_it_in_seller_field():
+    """OCR 誤放欄位時，完整公司統編仍須通過，避免清楚單據被誤報。"""
     analysis = {"buyerTaxId": "12345678", "sellerTaxId": "90531465"}
-    assert main.has_valid_company_tax_id(analysis) is False
+    assert main.has_valid_company_tax_id(analysis) is True
     analysis["buyerTaxId"] = "9053-1465"
     assert main.has_valid_company_tax_id(analysis) is True
 
