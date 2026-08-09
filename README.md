@@ -10,6 +10,7 @@
 - 內部員工在個人聊天室以一句口語描述代墊內容，Bot 自動解析完整性並用一張圖卡確認
 - 高爾賢個人聊天室的報價方案、草稿修改與明確送出事件會轉交報價後端
 - 內部員工可輸入 `外案 8月10號 1萬`，Bot 會補問缺少欄位；主管核准後才寫入獎金試算表
+- 高爾賢、阿筌與周暐在個人聊天室輸入精確關鍵字 `行程`，回傳今日與明日兩張藍色 Google Calendar 圖卡
 
 代墊範例：
 
@@ -35,6 +36,8 @@
 - `PROJECT_API_URL`、`PROJECT_API_KEY`（選填；近期未結案專案來源，未設定時使用手動輸入）
 - `BONUS_API_URL`、`BONUS_API_KEY`（外案待核准紀錄與獎金試算表寫入端點）
 - `QUOTE_WEBHOOK_URL`（報價後端 Webhook，預設 `https://linebot-bam2.onrender.com/webhook`）
+- `GOOGLE_CLIENT_ID`、`GOOGLE_CLIENT_SECRET`、`GOOGLE_REFRESH_TOKEN`（Google Calendar OAuth；refresh token 必須包含 `calendar.readonly` scope）
+- `CALENDAR_IDS`（固定合併 `contact@goalbrother.com,aurtorfilm@gmail.com`）
 
 員工確認送出後，Bot 會把 LINE 原始收據 Base64、檔名與交易識別碼交給 Apps Script；Apps Script 負責存入公司 Google Drive，並把附件連結與代墊資料寫入 Google Form 連動的回覆試算表。相同交易識別碼重試時應更新原紀錄，不重複建立附件或資料列。
 

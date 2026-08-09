@@ -30,6 +30,14 @@ services:
         value: gemini-3.6-flash
       - key: QUOTE_WEBHOOK_URL
         value: https://linebot-bam2.onrender.com/webhook
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_REFRESH_TOKEN
+        sync: false
+      - key: CALENDAR_IDS
+        value: contact@goalbrother.com,aurtorfilm@gmail.com
       - key: OWNER_USER_ID
         value: U6c6441cb38102499d1f80d4ea79a53ab
       - key: INTERNAL_USER_IDS
