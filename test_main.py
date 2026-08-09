@@ -130,6 +130,7 @@ QUOTE_USER_ID = "Ub983deb79584603885e5b28e9fdf2d5d"
 
 def test_external_case_approval_owner_is_kao_er_hsien():
     assert main.EXTERNAL_CASE_OWNER_USER_ID == QUOTE_USER_ID
+    assert main.EXTERNAL_CASE_TEST_MODE is True
 
 
 def test_external_case_owner_card_has_confirm_and_discuss_only():
@@ -188,7 +189,7 @@ def test_external_case_five_field_reply_always_advances_to_confirmation():
 
 
 def test_external_case_full_webhook_returns_visible_flex_confirmation(monkeypatch):
-    user_id = "U6c6441cb38102499d1f80d4ea79a53ab"
+    user_id = main.EXTERNAL_CASE_OWNER_USER_ID
     replies = []
     monkeypatch.setattr(main, "verify_signature", lambda raw, signature: True)
     monkeypatch.setattr(main, "reply_messages", lambda token, messages: replies.append((token, messages)))
