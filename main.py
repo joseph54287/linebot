@@ -1343,14 +1343,26 @@ totalAmount 必須是整張單據的應付或實付總額，不可使用統編�
                 {"text": prompt},
                 {"inlineData": {"mimeType": mime_type, "data": image_base64}},
             ]}],
-            "generationConfig": {"temperature": 0},
+            # 強制輸出 JSON 並保留足夠長度，避免 Gemini 2.5 將有效結果放在後續 part。
+            "generationConfig": {
+                "temperature": 0,
+                "maxOutputTokens": 2048,
+                "responseMimeType": "application/json",
+            },
         },
         timeout=45,
     )
-    response.raise_for_status()
+    try:
+        response.raise_for_status()
+    except requests.RequestException:
+        LOGGER.error("receipt vision HTTP error status=%s", response.status_code)
+        raise
     payload = response.json()
     try:
-        output = payload["candidates"][0]["content"]["parts"][0]["text"]
+        parts = payload["candidates"][0]["content"]["parts"]
+        output = "\n".join(str(part.get("text") or "") for part in parts if isinstance(part, dict) and part.get("text")).strip()
+        if not output:
+            raise KeyError("text")
     except (KeyError, IndexError, TypeError) as error:
         raise requests.RequestException("receipt vision returned no result") from error
     try:
@@ -2029,10 +2041,24 @@ async def webhook(request: Request):
                     reply_text(reply_token, str(error))
                     continue
                 except requests.RequestException:
+                    # 文字草稿的必要欄位已完整時，即使 OCR 暫時失敗也要保存收據並允許繼續。
+                    preserved_data = dict(session.get("data", {}))
+                    preserved_data["receiptBase64"] = receipt_base64
+                    preserved_data["receiptMimeType"] = receipt_mime
+                    preserved_data["companyTaxIdValid"] = False
+                    preserved_data["invoice"] = "否"
+                    preserved_data["note"] = (str(preserved_data.get("note") or "") + "；收據已保存，OCR 暫時無法驗證統編").strip("；")
+                    missing = missing_expense_fields(preserved_data)
+                    if not missing:
+                        session["data"] = preserved_data
+                        session["step"] = "quick_confirm"
+                        session["updated_at"] = time.time()
+                        reply_messages(reply_token, [build_expense_confirmation(preserved_data)])
+                        continue
                     session["step"] = "receipt_waiting_image"
                     session["receiptBase64"] = receipt_base64
                     session["receiptMimeType"] = receipt_mime
-                    reply_text(reply_token, "目前無法辨識收據，圖片已保留，請稍後再輸入「代墊」重試。")
+                    reply_text(reply_token, "收據已保留，但資料仍有缺漏，請重新上傳或補充缺少內容。")
                     continue
                 data = merge_pending_receipt_text(user_id, data)
                 remembered_project = session.get("data", {}).get("project") or (get_expense_batch(user_id) or {}).get("project")
