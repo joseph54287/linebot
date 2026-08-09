@@ -777,17 +777,22 @@ def test_unknown_item_and_no_answer_show_action_cards(monkeypatch):
 
 def test_submit_expense_adds_attachment_metadata(monkeypatch):
     class FakeResponse:
+        def __init__(self, payload):
+            self.payload = payload
+
         def raise_for_status(self):
             return None
 
         def json(self):
-            return {"ok": True, "row": 12, "transactionId": "tx-1", "receiptUrl": "https://drive.google.com/test"}
+            return self.payload
 
-    captured = {}
+    captured = []
 
     def fake_post(url, params, json, timeout):
-        captured.update(json["expense"])
-        return FakeResponse()
+        captured.append(json)
+        if json["action"] == "expense_receipt_upload":
+            return FakeResponse({"ok": True, "receiptUrl": "https://drive.google.com/test"})
+        return FakeResponse({"ok": True, "row": 12, "transactionId": json["expense"]["transactionId"], "receiptUrl": json["expense"]["receiptUrl"]})
 
     monkeypatch.setattr(main, "EXPENSE_API_URL", "https://example.com/expense")
     monkeypatch.setattr(main, "EXPENSE_API_KEY", "secret")
@@ -796,8 +801,12 @@ def test_submit_expense_adds_attachment_metadata(monkeypatch):
         "date": "2026-08-08", "project": "PJR", "payer": "周暐", "amount": 500,
         "receiptBase64": "image", "receiptMimeType": "image/jpeg", "companyTaxIdValid": True,
     })
-    assert captured["transactionId"]
-    assert captured["receiptFileName"].endswith(".jpg")
+    upload = captured[0]["expense"]
+    sheet_write = captured[1]["expense"]
+    assert upload["transactionId"]
+    assert upload["receiptFileName"].endswith(".jpg")
+    assert sheet_write["receiptUrl"] == "https://drive.google.com/test"
+    assert "receiptBase64" not in sheet_write
 
 
 def test_submit_expense_retries_once_when_apps_script_returns_html(monkeypatch):
@@ -828,6 +837,35 @@ def test_submit_expense_retries_once_when_apps_script_returns_html(monkeypatch):
     assert result["ok"] is True
     assert len(calls) == 2
     assert calls[0] == calls[1]
+
+
+def test_submit_expense_recovers_by_transaction_id_after_unknown_response(monkeypatch):
+    """兩次寫入回應皆異常時，以交易編號查到資料就視為成功。"""
+    actions = []
+
+    class FakeResponse:
+        def __init__(self, action):
+            self.action = action
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            if self.action == "expense":
+                raise ValueError("HTML response")
+            return {"ok": True, "found": True, "row": 22, "transactionId": "tx-recovered", "recordUrl": "https://sheet.example/22"}
+
+    def fake_post(url, params, json, timeout):
+        actions.append(json["action"])
+        return FakeResponse(json["action"])
+
+    monkeypatch.setattr(main, "EXPENSE_API_URL", "https://example.com/expense")
+    monkeypatch.setattr(main, "EXPENSE_API_KEY", "secret")
+    monkeypatch.setattr(main.requests, "post", fake_post)
+    monkeypatch.setattr(main.time, "sleep", lambda seconds: None)
+    result = main.submit_expense({"transactionId": "tx-recovered", "project": "PJR", "amount": 500})
+    assert result["row"] == 22
+    assert actions == ["expense", "expense", "expense_status"]
 
 
 def test_crane_expense_is_classified_as_project_expense():
