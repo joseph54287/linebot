@@ -29,7 +29,7 @@ GROUP_REGISTRY_API_KEY = os.environ.get("GROUP_REGISTRY_API_KEY", "")
 EXPENSE_API_URL = os.environ.get("EXPENSE_API_URL", GROUP_REGISTRY_URL).rstrip("/")
 EXPENSE_API_KEY = os.environ.get("EXPENSE_API_KEY", GROUP_REGISTRY_API_KEY)
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-RECEIPT_VISION_MODEL = os.environ.get("RECEIPT_VISION_MODEL", "gemini-3.6-flash")
+RECEIPT_VISION_MODEL = os.environ.get("RECEIPT_VISION_MODEL", "gemini-2.5-flash")
 PROJECT_API_URL = os.environ.get("PROJECT_API_URL", "").rstrip("/")
 PROJECT_API_KEY = os.environ.get("PROJECT_API_KEY", "")
 BONUS_API_URL = os.environ.get("BONUS_API_URL", "").rstrip("/")
@@ -1937,9 +1937,11 @@ async def webhook(request: Request):
                     EXPENSE_SESSIONS[user_id] = {"step": "receipt_processing", "updated_at": time.time(), "pending_text": "", "data": {"registrantUserId": user_id, "project": batch.get("project", "")}}
                     data, missing = process_receipt_image(user_id, receipt_base64, receipt_mime)
                 except ValueError:
+                    EXPENSE_SESSIONS.pop(user_id, None)
                     reply_text(reply_token, "這張圖片不像發票或收據，因此沒有啟動代墊登記。")
                     continue
                 except requests.RequestException:
+                    EXPENSE_SESSIONS.pop(user_id, None)
                     reply_text(reply_token, "目前無法辨識單據，請稍後重新上傳。")
                     continue
                 data["project"] = batch.get("project", "")
@@ -1958,9 +1960,11 @@ async def webhook(request: Request):
                     session["pending_text"] = ""
                     data, missing = process_receipt_image(user_id, receipt_base64, receipt_mime)
                 except ValueError as error:
+                    session["step"] = "receipt_waiting_image"
                     reply_text(reply_token, str(error))
                     continue
                 except requests.RequestException:
+                    session["step"] = "receipt_waiting_image"
                     session["receiptBase64"] = receipt_base64
                     session["receiptMimeType"] = receipt_mime
                     reply_text(reply_token, "目前無法辨識收據，圖片已保留，請稍後再輸入「代墊」重試。")
@@ -1987,9 +1991,11 @@ async def webhook(request: Request):
                     EXPENSE_SESSIONS[user_id] = {"step": "receipt_processing", "updated_at": time.time(), "pending_text": "", "data": {"registrantUserId": user_id}}
                     data, missing = process_receipt_image(user_id, receipt_base64, receipt_mime)
                 except ValueError:
+                    EXPENSE_SESSIONS.pop(user_id, None)
                     reply_text(reply_token, "這張圖片目前無法確認為代墊單據，請重新拍攝清楚完整的收據或發票。")
                     continue
                 except requests.RequestException:
+                    EXPENSE_SESSIONS.pop(user_id, None)
                     reply_text(reply_token, "目前無法辨識單據，請稍後重新上傳。")
                     continue
                 data = merge_pending_receipt_text(user_id, data)
@@ -2001,15 +2007,32 @@ async def webhook(request: Request):
 
             if session.get("step") not in {"receipt", "quick_confirm", "quick_missing", "quick_edit"}:
                 continue
-            session["data"]["receiptBase64"] = receipt_base64
-            session["data"]["receiptMimeType"] = receipt_mime
             if session.get("step") == "receipt":
+                session["data"]["receiptBase64"] = receipt_base64
+                session["data"]["receiptMimeType"] = receipt_mime
                 session["step"] = "note"
                 reply_messages(reply_token, [next_prompt(session)])
             else:
-                session["data"]["note"] = "已附收據"
-                session["step"] = "quick_confirm"
-                reply_messages(reply_token, [build_expense_confirmation(session["data"])])
+                previous_data = dict(session.get("data", {}))
+                previous_step = session.get("step", "quick_confirm")
+                session["step"] = "receipt_processing"
+                try:
+                    start_loading(user_id)
+                    receipt_data, _ = process_receipt_image(user_id, receipt_base64, receipt_mime)
+                except (ValueError, requests.RequestException):
+                    session["step"] = previous_step
+                    reply_text(reply_token, "目前無法辨識單據，原本資料已保留，請重新拍攝後再上傳。")
+                    continue
+                # 保留員工已明確輸入的欄位，其餘公司統編與單據資訊採用 OCR 結果。
+                for field in ("project", "item", "category", "amount", "date", "payer"):
+                    if previous_data.get(field) not in (None, ""):
+                        receipt_data[field] = previous_data[field]
+                if previous_data.get("note"):
+                    receipt_data["note"] = previous_data["note"]
+                session["data"] = receipt_data
+                missing = missing_expense_fields(receipt_data)
+                session["step"] = "quick_missing" if missing else "quick_confirm"
+                reply_messages(reply_token, [build_project_or_missing_prompt(session, missing) if missing else build_expense_confirmation(receipt_data)])
             continue
 
         if message_type != "text":
@@ -2193,6 +2216,9 @@ async def webhook(request: Request):
             )
         )
         if is_quick_expense:
+            # 確認圖卡後再次輸入完整代墊句子，代表開始新的一筆，而不是修改舊草稿。
+            if session and session.get("step") == "quick_confirm" and "代墊" in command:
+                session = None
             previous_text = session.get("raw_text", "") if session else ""
             combined_text = f"{previous_text}，{text}".strip("，")
             data = merge_expense_text(session.get("data", {}) if session else {}, text, user_id)
