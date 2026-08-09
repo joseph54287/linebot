@@ -1549,9 +1549,33 @@ def submit_expense(data: dict[str, Any]) -> dict[str, Any]:
             "receiptFileName",
             f"{data.get('date') or datetime.now(TAIPEI_TZ).date().isoformat()}_{data.get('payer') or '員工'}_{safe_project}_{data.get('amount') or '待補'}.{extension}",
         )
-    response = requests.post(EXPENSE_API_URL, params={"key": EXPENSE_API_KEY}, json={"action": "expense", "expense": data}, timeout=30)
-    response.raise_for_status()
-    payload = response.json()
+    # Apps Script 偶爾會在已寫入後回傳空白或 HTML；沿用交易編號重試一次可避免重複列。
+    payload: dict[str, Any] | None = None
+    for attempt in range(2):
+        try:
+            response = requests.post(
+                EXPENSE_API_URL,
+                params={"key": EXPENSE_API_KEY},
+                json={"action": "expense", "expense": data},
+                timeout=30,
+            )
+            response.raise_for_status()
+            parsed = response.json()
+            if not isinstance(parsed, dict):
+                raise ValueError("expense api response is not an object")
+            payload = parsed
+            break
+        except (requests.Timeout, requests.ConnectionError, ValueError) as error:
+            LOGGER.warning(
+                "expense api transient response error attempt=%s type=%s",
+                attempt + 1,
+                type(error).__name__,
+            )
+            if attempt == 1:
+                raise requests.RequestException("expense_api_invalid_response") from error
+            time.sleep(1)
+    if payload is None:
+        raise requests.RequestException("expense_api_empty_response")
     if not payload.get("ok"):
         error_code = re.sub(r"[^0-9A-Za-z_-]", "", str(payload.get("error") or "expense_api_rejected"))[:80]
         raise requests.RequestException(error_code or "expense_api_rejected")
