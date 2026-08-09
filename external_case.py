@@ -159,7 +159,7 @@ def parse_details(text: str) -> dict[str, str]:
     project = re.search(r"(?:案名|專案名稱|專案)\s*[：:]\s*([^\n]+)", text)
     case_type = re.search(r"案型\s*[：:]\s*([^\n]+)", text)
     destination = re.search(r"(?:款項(?:進入|匯入)?|入帳)\s*[：:]\s*([^\n]+)", text)
-    contact = re.search(r"(?:聯繫|聯絡)窗口\s*[：:]\s*([^\n]+)", text)
+    contact = re.search(r"(?:(?:聯繫|聯絡)窗口|窗口)\s*[：:]\s*([^\n]+)", text)
     if project:
         result["projectName"] = project.group(1).strip()
     if case_type:
@@ -181,17 +181,27 @@ def confirmation_card(data: dict[str, Any]) -> dict[str, Any]:
     pretax, tax, gross = tax_amounts(data)
     employee_share = round(data["amount"] * 0.4)
     company_share = data["amount"] - employee_share
-    summary = "\n".join([
-        data["projectName"], f"日期：{data['date']}", f"輸入方式：{data.get('taxMode', '稅外')}",
-        f"未稅：{money(pretax)}｜稅額：{money(tax)}", f"公司收款總額：{money(gross)}",
-        f"案型：{data['caseType']}", f"款項匯入：{data['destination']}", "",
-        f"預計匯款：{data['paymentDate']}", f"聯繫窗口：{data['contact']}",
-        f"你應得：{money(employee_share)}", f"公司應得：{money(company_share)}",
-    ])
-    return {"type": "template", "altText": "請最後確認外案資料", "template": {
-        "type": "buttons", "title": "最後確認", "text": summary[:160], "actions": [
-            {"type": "postback", "label": "確認送出", "data": "external:submit", "displayText": "確認送出"},
-        ],
+    rows = [
+        ("案名", data["projectName"]), ("案件日期", data["date"]), ("案型", data["caseType"]),
+        ("計價方式", data.get("taxMode", "稅外")), ("未稅金額", money(pretax)),
+        ("稅額", money(tax)), ("含稅收款", money(gross)), ("款項進入", data["destination"]),
+        ("預計匯款日", data["paymentDate"]), ("聯繫窗口", data["contact"]),
+        ("你的獎金 40%", money(employee_share)), ("公司 60%", money(company_share)),
+    ]
+    body: list[dict[str, Any]] = []
+    for label, value in rows:
+        body.append({"type": "text", "text": f"{label}：{value}", "size": "sm", "color": "#1F2937", "wrap": True, "margin": "md"})
+    return {"type": "flex", "altText": "請最後確認外案資料", "contents": {
+        "type": "bubble",
+        "header": {"type": "box", "layout": "vertical", "backgroundColor": "#193B65", "paddingAll": "20px", "contents": [
+            {"type": "text", "text": "最後確認", "color": "#FFFFFF", "size": "xl", "weight": "bold"},
+            {"type": "text", "text": "確認後才會送進公司營運系統", "color": "#DCE7F5", "size": "xs", "margin": "sm"},
+        ]},
+        "body": {"type": "box", "layout": "vertical", "paddingAll": "20px", "contents": body},
+        "footer": {"type": "box", "layout": "vertical", "paddingAll": "20px", "contents": [{
+            "type": "button", "style": "primary", "color": "#193B65",
+            "action": {"type": "postback", "label": "確認送出", "data": "external:submit", "displayText": "確認送出"},
+        }]},
     }}
 
 

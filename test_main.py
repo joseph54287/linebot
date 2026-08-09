@@ -159,8 +159,9 @@ def test_external_case_uses_two_step_prompt_and_one_final_confirmation():
         "paymentDate": "2026-09-15", "contact": "王小姐",
     })
     card = external_case.confirmation_card(data)
-    actions = card["template"]["actions"]
-    assert actions == [{"type": "postback", "label": "確認送出", "data": "external:submit", "displayText": "確認送出"}]
+    assert card["type"] == "flex"
+    action = card["contents"]["footer"]["contents"][0]["action"]
+    assert action == {"type": "postback", "label": "確認送出", "data": "external:submit", "displayText": "確認送出"}
 
 
 def test_external_case_five_field_reply_always_advances_to_confirmation():
@@ -171,6 +172,46 @@ def test_external_case_five_field_reply_always_advances_to_confirmation():
     )
     assert session["step"] == "confirm"
     assert session["data"]["contact"] == "王小姐"
+
+
+def test_external_case_full_webhook_returns_visible_flex_confirmation(monkeypatch):
+    user_id = "U6c6441cb38102499d1f80d4ea79a53ab"
+    replies = []
+    monkeypatch.setattr(main, "verify_signature", lambda raw, signature: True)
+    monkeypatch.setattr(main, "reply_messages", lambda token, messages: replies.append((token, messages)))
+    external_case.SESSIONS.pop(user_id, None)
+
+    def deliver(text, token):
+        payload = {"events": [{
+            "type": "message", "replyToken": token,
+            "source": {"type": "user", "userId": user_id},
+            "message": {"type": "text", "text": text},
+        }]}
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        delivered = False
+
+        async def receive():
+            nonlocal delivered
+            if delivered:
+                return {"type": "http.disconnect"}
+            delivered = True
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        request = Request({
+            "type": "http", "method": "POST", "path": "/webhook",
+            "headers": [(b"x-line-signature", b"test")],
+        }, receive)
+        assert asyncio.run(main.webhook(request)) == {"status": "ok"}
+
+    deliver("8月10號外案8萬", "reply-start")
+    deliver(
+        "案名：品牌形象片\n案型：導演案\n款項進入：公司\n預計匯款日：9月15日\n聯繫窗口：王小姐",
+        "reply-confirm",
+    )
+    assert replies[-1][0] == "reply-confirm"
+    card = replies[-1][1][0]
+    assert card["type"] == "flex"
+    assert card["contents"]["footer"]["contents"][0]["action"]["data"] == "external:submit"
 
 
 def all_actions(value):
