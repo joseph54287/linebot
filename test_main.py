@@ -737,6 +737,36 @@ def test_submit_expense_adds_attachment_metadata(monkeypatch):
     assert captured["receiptFileName"].endswith(".jpg")
 
 
+def test_submit_expense_retries_once_when_apps_script_returns_html(monkeypatch):
+    """Apps Script 暫時回傳非 JSON 時，沿用同一交易編號重試且不得建立重複資料。"""
+    calls = []
+
+    class FakeResponse:
+        def __init__(self, valid):
+            self.valid = valid
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            if not self.valid:
+                raise ValueError("Expecting value: line 1 column 1")
+            return {"ok": True, "row": 12, "transactionId": "tx-1"}
+
+    def fake_post(url, params, json, timeout):
+        calls.append(json["expense"]["transactionId"])
+        return FakeResponse(valid=len(calls) == 2)
+
+    monkeypatch.setattr(main, "EXPENSE_API_URL", "https://example.com/expense")
+    monkeypatch.setattr(main, "EXPENSE_API_KEY", "secret")
+    monkeypatch.setattr(main.requests, "post", fake_post)
+    monkeypatch.setattr(main.time, "sleep", lambda seconds: None)
+    result = main.submit_expense({"date": "2026-08-08", "project": "PJR", "amount": 500})
+    assert result["ok"] is True
+    assert len(calls) == 2
+    assert calls[0] == calls[1]
+
+
 def test_crane_expense_is_classified_as_project_expense():
     assert main.infer_category("PJR 專案吊車費用") == "案件支出（餐飲、道具、人員...）"
     assert main.infer_category("拍攝現場機具租賃") == "案件支出（餐飲、道具、人員...）"
