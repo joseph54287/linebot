@@ -1826,7 +1826,7 @@ async def webhook(request: Request):
                 reply_text(reply_token, "目前無法讀取代墊統計，請稍後再試；本次沒有建立代墊紀錄。")
             continue
 
-        # 「外案 8月10號 1萬」可直接帶入已辨識欄位，再逐題詢問缺少資料。
+        # 「8月10號外案 1萬」可直接帶入日期、金額，再一次詢問其餘資料。
         if source.get("type") == "user" and external_case.is_external_case_text(text):
             if user_id not in INTERNAL_USER_IDS:
                 reply_text(reply_token, "你的帳號尚未加入公司內部登記名單。")

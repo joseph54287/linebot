@@ -17,19 +17,36 @@ def test_external_case_short_message_understands_date_and_ten_thousand():
     )
     assert data["date"].endswith("-08-10")
     assert data["amount"] == 10000
-    assert external_case.next_step(data) == "projectName"
+    assert external_case.next_step(data) == "details"
+
+
+def test_external_case_can_start_when_external_keyword_is_not_first():
+    assert external_case.is_external_case_text("8 月 10 號外案 3 萬") is True
+
+
+def test_external_case_defaults_to_tax_exclusive_and_calculates_invoice_total():
+    data = external_case.parse_initial("8月10號外案 3萬", "U-tax", "周暐")
+    assert data["taxMode"] == "稅外"
+    assert external_case.tax_amounts(data) == (30000, 1500, 31500)
+
+
+def test_external_case_explicit_tax_inclusive_is_converted_to_pretax():
+    data = external_case.parse_initial("外案 8月10號 3萬含稅", "U-tax", "周暐")
+    assert data["taxMode"] == "含稅"
+    assert external_case.tax_amounts(data) == (28571, 1429, 30000)
 
 
 def test_external_case_conversation_only_asks_missing_fields():
     session = external_case.start("外案 8/10 1.5萬 剪片", "U-external", "阿全")
     assert session["data"]["amount"] == 15000
-    assert session["data"]["caseType"] == "剪輯"
-    assert session["step"] == "projectName"
-    session = external_case.accept_text("U-external", "品牌活動精華")
-    assert session["step"] == "destination"
-    session = external_case.accept_option("U-external", "destination", "公司")
+    assert session["data"]["caseType"] == "剪接案"
+    assert session["step"] == "details"
+    session = external_case.accept_text(
+        "U-external", "案名：品牌活動精華\n案型：剪接案\n款項：公司\n預計匯款日：9月15日"
+    )
     assert session["step"] == "confirm"
     assert session["data"]["projectName"] == "品牌活動精華"
+    assert session["data"]["paymentDate"].endswith("-09-15")
 
 
 def test_external_case_invalid_date_is_not_guessed():
