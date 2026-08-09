@@ -4,6 +4,78 @@ import asyncio
 import json
 
 import main
+
+
+def test_calendar_command_merges_two_days_into_blue_cards(monkeypatch):
+    calls = []
+    today_event = {
+        "summary": "AI 課程",
+        "start": {"dateTime": "2026-08-09T10:00:00+08:00"},
+        "end": {"dateTime": "2026-08-09T12:00:00+08:00"},
+        "location": "台北",
+        "htmlLink": "https://calendar.google.com/event?eid=today",
+    }
+
+    def fake_fetch(start, end):
+        calls.append((start, end))
+        return [today_event] if len(calls) == 1 else []
+
+    monkeypatch.setattr(main, "fetch_calendar_events", fake_fetch)
+    message = main.calendar_command_message(
+        main.datetime(2026, 8, 9, 18, 0, tzinfo=main.TAIPEI_TZ)
+    )
+    assert len(calls) == 2
+    assert message["altText"] == "今日與明日行程"
+    today, tomorrow = message["contents"]["contents"]
+    assert today["header"]["contents"][0]["text"] == "今日行程"
+    assert today["header"]["backgroundColor"] == "#2563EB"
+    assert today["body"]["contents"][0]["contents"][0]["text"] == "AI 課程"
+    assert today["body"]["contents"][0]["contents"][1]["text"] == "10:00–12:00｜台北"
+    assert tomorrow["header"]["contents"][0]["text"] == "明日行程"
+    assert tomorrow["body"]["contents"][0]["text"] == "沒有行程"
+
+
+def test_calendar_fetch_deduplicates_identical_events(monkeypatch):
+    monkeypatch.setattr(main, "google_access_token", lambda: "access-token")
+    event = {
+        "summary": "公司會議",
+        "start": {"dateTime": "2026-08-09T13:00:00+08:00"},
+        "end": {"dateTime": "2026-08-09T14:00:00+08:00"},
+        "location": "辦公室",
+    }
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"items": [event]}
+
+    calls = []
+    monkeypatch.setattr(main.requests, "get", lambda *args, **kwargs: calls.append((args, kwargs)) or Response())
+    start = main.datetime(2026, 8, 9, tzinfo=main.TAIPEI_TZ)
+    events = main.fetch_calendar_events(start, start + main.timedelta(days=1))
+    assert len(calls) == 2
+    assert events == [event]
+
+
+def test_calendar_command_requires_exact_keyword_and_internal_user():
+    event = {
+        "type": "message",
+        "source": {"type": "user", "userId": main.QUOTE_OWNER_USER_ID},
+        "message": {"type": "text", "text": "行程"},
+    }
+    assert main.is_calendar_command(event) is True
+    for user_id in main.INTERNAL_USER_IDS:
+        event["source"]["userId"] = user_id
+        assert main.is_calendar_command(event) is True
+    event["message"]["text"] = "本週行程"
+    assert main.is_calendar_command(event) is False
+    event["message"]["text"] = "行程"
+    event["source"]["userId"] = "U-other"
+    assert main.is_calendar_command(event) is False
+    event["source"] = {"type": "group", "userId": main.QUOTE_OWNER_USER_ID}
+    assert main.is_calendar_command(event) is False
 from starlette.requests import Request
 
 

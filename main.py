@@ -36,6 +36,17 @@ QUOTE_WEBHOOK_URL = os.environ.get(
     "https://linebot-bam2.onrender.com/webhook",
 ).rstrip("/")
 QUOTE_OWNER_USER_ID = "Ub983deb79584603885e5b28e9fdf2d5d"
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN", "")
+CALENDAR_IDS = tuple(
+    calendar_id.strip()
+    for calendar_id in os.environ.get(
+        "CALENDAR_IDS",
+        "contact@goalbrother.com,aurtorfilm@gmail.com",
+    ).split(",")
+    if calendar_id.strip()
+)
 OWNER_USER_ID = os.environ.get(
     "OWNER_USER_ID",
     "U6c6441cb38102499d1f80d4ea79a53ab",
@@ -168,6 +179,19 @@ def is_quote_event(event: dict[str, Any]) -> bool:
     return False
 
 
+def is_calendar_command(event: dict[str, Any]) -> bool:
+    """只允許三位內部成員在 Bot 個人聊天室使用精確關鍵字「行程」。"""
+    source = event.get("source", {})
+    message = event.get("message", {})
+    return (
+        event.get("type") == "message"
+        and source.get("type") == "user"
+        and source.get("userId") in INTERNAL_USER_IDS
+        and message.get("type") == "text"
+        and message.get("text", "").strip() == "行程"
+    )
+
+
 def forward_quote_webhook(body: bytes, signature: str) -> bool:
     """原樣轉送 LINE request；失敗不重試，避免重複寄出報價信。"""
     try:
@@ -271,6 +295,140 @@ def reply_messages(reply_token: str, messages: list[dict[str, Any]]) -> None:
 def reply_text(reply_token: str, text: str) -> None:
     """回覆單一文字訊息。"""
     reply_messages(reply_token, [{"type": "text", "text": text}])
+
+
+def google_access_token() -> str:
+    """以 Render Secret 中的 refresh token 取得短效 Google access token。"""
+    if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN):
+        raise requests.RequestException("Google Calendar OAuth 尚未設定")
+    response = requests.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "refresh_token": GOOGLE_REFRESH_TOKEN,
+            "grant_type": "refresh_token",
+        },
+        timeout=10,
+    )
+    response.raise_for_status()
+    token = response.json().get("access_token", "")
+    if not token:
+        raise requests.RequestException("Google OAuth 未回傳 access token")
+    return token
+
+
+def fetch_calendar_events(start: datetime, end: datetime) -> list[dict[str, Any]]:
+    """合併指定兩本 Google Calendar，並去除完全相同的事件。"""
+    token = google_access_token()
+    events: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for calendar_id in CALENDAR_IDS:
+        response = requests.get(
+            f"https://www.googleapis.com/calendar/v3/calendars/{requests.utils.quote(calendar_id, safe='')}/events",
+            headers={"Authorization": f"Bearer {token}"},
+            params={
+                "timeMin": start.isoformat(),
+                "timeMax": end.isoformat(),
+                "singleEvents": "true",
+                "orderBy": "startTime",
+                "timeZone": "Asia/Taipei",
+            },
+            timeout=15,
+        )
+        response.raise_for_status()
+        for item in response.json().get("items", []):
+            if item.get("status") == "cancelled":
+                continue
+            event_start = item.get("start", {}).get("dateTime") or item.get("start", {}).get("date", "")
+            event_end = item.get("end", {}).get("dateTime") or item.get("end", {}).get("date", "")
+            key = (
+                item.get("summary", "未命名行程"),
+                event_start,
+                event_end,
+                item.get("location", ""),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            events.append(item)
+
+    def sort_key(item: dict[str, Any]) -> str:
+        return item.get("start", {}).get("dateTime") or item.get("start", {}).get("date", "")
+
+    return sorted(events, key=sort_key)
+
+
+def calendar_event_time(item: dict[str, Any]) -> str:
+    """將 Google Calendar 起訖時間轉為台北時間。"""
+    start_data = item.get("start", {})
+    if start_data.get("date"):
+        return "全天"
+    try:
+        start = datetime.fromisoformat(start_data["dateTime"].replace("Z", "+00:00")).astimezone(TAIPEI_TZ)
+        end = datetime.fromisoformat(item["end"]["dateTime"].replace("Z", "+00:00")).astimezone(TAIPEI_TZ)
+    except (KeyError, ValueError):
+        return "時間待確認"
+    return f"{start:%H:%M}–{end:%H:%M}"
+
+
+def calendar_day_card(label: str, day: datetime, events: list[dict[str, Any]]) -> dict[str, Any]:
+    """建立單日藍色 LINE 行程圖卡。"""
+    rows: list[dict[str, Any]] = []
+    for item in events[:12]:
+        details = calendar_event_time(item)
+        if item.get("location"):
+            details += f"｜{item['location']}"
+        row_contents: list[dict[str, Any]] = [
+            {"type": "text", "text": item.get("summary") or "未命名行程", "weight": "bold", "size": "sm", "wrap": True},
+            {"type": "text", "text": details, "size": "xs", "color": "#64748B", "wrap": True, "margin": "xs"},
+        ]
+        link = item.get("hangoutLink") or item.get("htmlLink")
+        row: dict[str, Any] = {
+            "type": "box", "layout": "vertical", "margin": "md", "paddingAll": "12px",
+            "backgroundColor": "#EFF6FF", "cornerRadius": "12px", "contents": row_contents,
+        }
+        if link:
+            row["action"] = {"type": "uri", "label": "開啟行程", "uri": link}
+        rows.append(row)
+    if not rows:
+        rows.append({"type": "text", "text": "沒有行程", "align": "center", "color": "#64748B", "margin": "xl"})
+    elif len(events) > 12:
+        rows.append({"type": "text", "text": f"另有 {len(events) - 12} 項行程，請至 Google Calendar 查看", "size": "xs", "color": "#64748B", "wrap": True, "margin": "md"})
+
+    return {
+        "type": "bubble",
+        "size": "mega",
+        "header": {
+            "type": "box", "layout": "vertical", "backgroundColor": "#2563EB", "paddingAll": "20px",
+            "contents": [
+                {"type": "text", "text": label, "color": "#FFFFFF", "weight": "bold", "size": "xl"},
+                {"type": "text", "text": day.strftime("%Y/%m/%d"), "color": "#DBEAFE", "size": "sm", "margin": "sm"},
+            ],
+        },
+        "body": {"type": "box", "layout": "vertical", "paddingAll": "16px", "contents": rows},
+    }
+
+
+def calendar_command_message(now: datetime | None = None) -> dict[str, Any]:
+    """查詢今日與明日後，回傳可左右滑動的兩張圖卡。"""
+    current = (now or datetime.now(TAIPEI_TZ)).astimezone(TAIPEI_TZ)
+    today = current.replace(hour=0, minute=0, second=0, microsecond=0)
+    tomorrow = today + timedelta(days=1)
+    day_after = tomorrow + timedelta(days=1)
+    today_events = fetch_calendar_events(today, tomorrow)
+    tomorrow_events = fetch_calendar_events(tomorrow, day_after)
+    return {
+        "type": "flex",
+        "altText": "今日與明日行程",
+        "contents": {
+            "type": "carousel",
+            "contents": [
+                calendar_day_card("今日行程", today, today_events),
+                calendar_day_card("明日行程", tomorrow, tomorrow_events),
+            ],
+        },
+    }
 
 
 def start_loading(user_id: str, seconds: int = 60) -> None:
@@ -1790,6 +1948,15 @@ async def webhook(request: Request):
         text = message.get("text", "").strip()
         command = text.casefold()
 
+        # 三位內部成員在 Bot 個人聊天室輸入精確關鍵字「行程」時，讀取今日與明日。
+        if is_calendar_command(event):
+            try:
+                start_loading(user_id)
+                reply_messages(reply_token, [calendar_command_message()])
+            except requests.RequestException:
+                reply_text(reply_token, "目前無法完整讀取 Google Calendar，請稍後再試；本次沒有將資料顯示為無行程。")
+            continue
+
         session = get_expense_session(user_id) if source.get("type") == "user" else None
         # 圖片正在 OCR 時先把文字併入同一筆，最後只回傳一張完整確認圖卡。
         if session and session.get("step") == "receipt_processing" and (
@@ -2046,6 +2213,9 @@ async def health():
         "expense_configured": bool(EXPENSE_API_URL and EXPENSE_API_KEY),
         "receipt_vision_configured": bool(GEMINI_API_KEY),
         "quote_webhook_configured": bool(QUOTE_WEBHOOK_URL),
+        "calendar_configured": bool(
+            GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN and CALENDAR_IDS
+        ),
         "internal_user_count": len(INTERNAL_USER_IDS),
         "owner_configured": bool(OWNER_USER_ID),
     }
