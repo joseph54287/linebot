@@ -589,6 +589,29 @@ def test_process_receipt_uses_second_pass_to_find_total(monkeypatch):
     assert data["receiptSecondPass"] is True
 
 
+def test_receipt_vision_reads_json_from_later_response_part(monkeypatch):
+    """Gemini 將 JSON 放在後續 part 時，仍必須完成單據辨識。"""
+    class Response:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "candidates": [{"content": {"parts": [
+                    {"thought": True},
+                    {"text": '{"isReceipt":true,"totalAmount":500,"items":["加油"]}'},
+                ]}}]
+            }
+
+    monkeypatch.setattr(main, "GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(main.requests, "post", lambda *args, **kwargs: Response())
+    result = main.analyze_receipt_image("image", "image/jpeg")
+    assert result["isReceipt"] is True
+    assert result["totalAmount"] == 500
+
+
 def test_open_projects_filter_rank_without_age_or_limit():
     projects = [
         {"id": "old", "name": "舊專案", "status": "進行中", "updatedAt": "2026-01-01"},
