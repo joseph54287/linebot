@@ -100,16 +100,32 @@ def test_external_case_ten_wan_never_reprompts_for_amount():
 
 def test_external_case_uses_two_step_prompt_and_one_final_confirmation():
     detail_prompt = external_case.prompt("details")
-    assert detail_prompt["text"].startswith("金額收到。")
-    assert "請再補這 4 項" in detail_prompt["text"]
+    assert detail_prompt["text"] == (
+        "金額收到，請再補這五項\n\n"
+        "案名：\n"
+        "案型：導演案／剪接案／製片案／其他\n"
+        "款項進入：公司／員工個人／尚未確認\n"
+        "預計匯款日：\n"
+        "聯繫窗口："
+    )
     data = external_case.parse_initial("8月10號外案8萬", "U-test", "爾賢")
     data.update({
         "projectName": "測試專案", "caseType": "導演案", "destination": "公司",
-        "paymentDate": "2026-09-15",
+        "paymentDate": "2026-09-15", "contact": "王小姐",
     })
     card = external_case.confirmation_card(data)
     actions = card["template"]["actions"]
     assert actions == [{"type": "postback", "label": "確認送出", "data": "external:submit", "displayText": "確認送出"}]
+
+
+def test_external_case_five_field_reply_always_advances_to_confirmation():
+    external_case.start("8月10號外案8萬", "U-five", "爾賢")
+    session = external_case.accept_text(
+        "U-five",
+        "案名：品牌形象片\n案型：導演案\n款項進入：公司\n預計匯款日：9月15日\n聯繫窗口：王小姐",
+    )
+    assert session["step"] == "confirm"
+    assert session["data"]["contact"] == "王小姐"
 
 
 def all_actions(value):
