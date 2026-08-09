@@ -1599,42 +1599,76 @@ def process_receipt_image(user_id: str, image_base64: str, mime_type: str) -> tu
     return receipt_analysis_to_expense(analysis, user_id, image_base64, mime_type)
 
 
+def expense_api_post(body: dict[str, Any], timeout: int = 30) -> dict[str, Any]:
+    """呼叫代墊 API，並確保回應一定是 JSON 物件。"""
+    response = requests.post(
+        EXPENSE_API_URL,
+        params={"key": EXPENSE_API_KEY},
+        json=body,
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError("expense api response is not an object")
+    return payload
+
+
+def expense_status(transaction_id: str) -> dict[str, Any] | None:
+    """寫入回應不明時，以交易編號查詢實際結果。"""
+    try:
+        payload = expense_api_post({"action": "expense_status", "transactionId": transaction_id}, timeout=20)
+    except (requests.RequestException, ValueError):
+        return None
+    return payload if payload.get("ok") and payload.get("found") else None
+
+
 def submit_expense(data: dict[str, Any]) -> dict[str, Any]:
-    """交由 Google Apps Script 上傳收據並新增支出資料。"""
+    """先保存收據，再以輕量資料寫入 Google Sheet。"""
     if not EXPENSE_API_URL or not EXPENSE_API_KEY:
         raise requests.RequestException("expense api is not configured")
     # 同一暫存重試時沿用交易識別碼，讓 Apps Script 避免建立重複附件或資料列。
     data.setdefault("transactionId", uuid.uuid4().hex)
-    if data.get("receiptBase64"):
+    transaction_id = str(data["transactionId"])
+    payload_data = dict(data)
+    if payload_data.get("receiptBase64"):
         extension = "png" if data.get("receiptMimeType") == "image/png" else "jpg"
         safe_project = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff_-]+", "-", str(data.get("project") or "未指定"))[:40]
-        data.setdefault(
+        payload_data.setdefault(
             "receiptFileName",
             f"{data.get('date') or datetime.now(TAIPEI_TZ).date().isoformat()}_{data.get('payer') or '員工'}_{safe_project}_{data.get('amount') or '待補'}.{extension}",
         )
+        try:
+            receipt_result = expense_api_post(
+                {"action": "expense_receipt_upload", "expense": payload_data}, timeout=60
+            )
+        except (requests.RequestException, ValueError) as error:
+            raise requests.RequestException("receipt_upload_invalid_response") from error
+        if not receipt_result.get("ok"):
+            error_code = re.sub(r"[^0-9A-Za-z_-]", "", str(receipt_result.get("error") or "receipt_upload_failed"))[:80]
+            raise requests.RequestException(error_code or "receipt_upload_failed")
+        receipt_url = str(receipt_result.get("receiptUrl") or "")
+        if not receipt_url.startswith("https://"):
+            raise requests.RequestException("receipt_upload_missing_url")
+        payload_data["receiptUrl"] = receipt_url
+        payload_data.pop("receiptBase64", None)
+        payload_data.pop("receiptMimeType", None)
     # Apps Script 偶爾會在已寫入後回傳空白或 HTML；沿用交易編號重試一次可避免重複列。
     payload: dict[str, Any] | None = None
     for attempt in range(2):
         try:
-            response = requests.post(
-                EXPENSE_API_URL,
-                params={"key": EXPENSE_API_KEY},
-                json={"action": "expense", "expense": data},
-                timeout=30,
-            )
-            response.raise_for_status()
-            parsed = response.json()
-            if not isinstance(parsed, dict):
-                raise ValueError("expense api response is not an object")
-            payload = parsed
+            payload = expense_api_post({"action": "expense", "expense": payload_data}, timeout=30)
             break
-        except (requests.Timeout, requests.ConnectionError, ValueError) as error:
+        except (requests.RequestException, ValueError) as error:
             LOGGER.warning(
                 "expense api transient response error attempt=%s type=%s",
                 attempt + 1,
                 type(error).__name__,
             )
             if attempt == 1:
+                recovered = expense_status(transaction_id)
+                if recovered:
+                    return recovered
                 raise requests.RequestException("expense_api_invalid_response") from error
             time.sleep(1)
     if payload is None:
@@ -2451,8 +2485,9 @@ async def webhook(request: Request):
             if missing:
                 reply_messages(reply_token, [build_project_or_missing_prompt(session, missing)])
             else:
-                await asyncio.to_thread(save_expense_draft, user_id, session)
                 reply_messages(reply_token, [build_expense_confirmation(data)])
+                # LINE 圖卡先送出，再保存草稿；Google 暫時變慢也不會讓員工看見空白。
+                await asyncio.to_thread(save_expense_draft, user_id, session)
             continue
 
         if session:
