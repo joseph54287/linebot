@@ -213,6 +213,22 @@ def reply_text(reply_token: str, text: str) -> None:
     reply_messages(reply_token, [{"type": "text", "text": text}])
 
 
+def start_loading(user_id: str, seconds: int = 60) -> None:
+    """在一對一聊天室顯示 LINE 原生處理動畫；失敗不阻斷主流程。"""
+    if not user_id:
+        return
+    try:
+        response = requests.post(
+            "https://api.line.me/v2/bot/chat/loading/start",
+            headers=line_headers(),
+            json={"chatId": user_id, "loadingSeconds": seconds},
+            timeout=5,
+        )
+        response.raise_for_status()
+    except requests.RequestException:
+        LOGGER.warning("無法顯示 LINE 載入動畫")
+
+
 def option_card(title: str, options: list[str], field: str) -> dict[str, Any]:
     """建立可直接點選的支出登記 Flex 圖卡。"""
     buttons = [
@@ -282,15 +298,10 @@ def project_candidate_card(projects: list[dict[str, Any]], page: int = 0) -> dic
         "margin": "sm",
         "action": {
             "type": "postback",
-            "label": "搜尋／填寫專案",
+            "label": "手動輸入專案名稱",
             "data": "expense:project:search",
-            "displayText": "搜尋或填寫專案",
+            "displayText": "手動輸入專案名稱",
         },
-    }, {
-        "type": "button",
-        "height": "sm",
-        "margin": "sm",
-        "action": {"type": "postback", "label": "無專案", "data": "expense:project:none", "displayText": "無專案"},
     }, {
         "type": "button",
         "height": "sm",
@@ -565,7 +576,7 @@ def merge_expense_text(existing: dict[str, Any], text: str, user_id: str) -> dic
 def missing_expense_fields(data: dict[str, Any]) -> list[str]:
     """以後端固定規則驗證必要欄位，不直接信任文字解析結果。"""
     required = {
-        "project": "專案名稱（沒有專案請寫「專案無」）",
+        "project": "專案名稱",
         "item": "消費項目",
         "amount": "金額",
         "category": "項目分類或更清楚的消費內容",
@@ -586,20 +597,30 @@ def build_missing_prompt(missing: list[str]) -> dict[str, Any]:
 def looks_like_expense_intent(text: str) -> bool:
     """辨識沒有寫出「代墊」、但語意仍明確是公司支出的句子。"""
     intent_words = ["我先付", "我墊", "幫公司買", "幫公司付", "先幫公司付", "公司支出"]
-    return any(word in text for word in intent_words) and infer_amount(text) is not None
+    amount = infer_amount(text)
+    item = infer_item_option(text)
+    has_date = bool(re.search(r"今天|昨天|昨日|前天|20\d{2}[年/\-.]|\d{1,2}[月/\-.]\d{1,2}", text))
+    score = sum([amount is not None, bool(item), has_date, any(word in text for word in intent_words)])
+    return amount is not None and score >= 2
 
 
 def looks_like_expense_query(text: str) -> bool:
     """辨識員工是在查詢自己的代墊，而不是新增一筆代墊。"""
     folded = text.casefold()
-    if "代墊" not in folded:
-        return False
-    query_words = ["詢問", "查詢", "情況", "狀況", "統計", "紀錄", "記錄", "進度", "狀態", "多少", "我的"]
-    return any(word in folded for word in query_words)
+    expense_words = ["代墊", "墊款", "待撥款", "待領款", "費用", "支出"]
+    query_words = ["詢問", "查詢", "情況", "狀況", "統計", "紀錄", "記錄", "進度", "狀態", "多少", "幾筆", "總額", "合計", "我的", "花最多"]
+    return any(word in folded for word in expense_words) and any(word in folded for word in query_words)
+
+
+def looks_like_supplement_query(text: str) -> bool:
+    """寬鬆辨識員工查詢本人未完成或待補資料。"""
+    folded = text.casefold().replace(" ", "")
+    phrases = ["待補件", "代補件", "我要補件", "缺什麼資料", "要補資料", "收據要補", "代墊缺什麼", "資料不完整", "還沒完成的代墊", "剛才那筆要補"]
+    return any(phrase in folded for phrase in phrases)
 
 
 def get_expense_stats(user_id: str) -> dict[str, Any]:
-    """從共用支出表取得員工本月個人代墊統計。"""
+    """從共用支出表取得員工最近一個月的個人代墊統計。"""
     if not EXPENSE_API_URL or not EXPENSE_API_KEY:
         raise requests.RequestException("expense api is not configured")
     payer = INTERNAL_USER_NAMES.get(user_id, "")
@@ -612,13 +633,16 @@ def get_expense_stats(user_id: str) -> dict[str, Any]:
 
 
 def expense_stats_card(stats: dict[str, Any]) -> dict[str, Any]:
-    """建立員工自己的本月代墊統計圖卡。"""
+    """建立最近一個月統計圖卡，並依專案名稱分類。"""
+    projects = stats.get("projects") if isinstance(stats.get("projects"), list) else []
+    project_lines = [f"・{item.get('project', '未分類')}：{item.get('count', 0)} 筆／${float(item.get('total', 0)):g}" for item in projects[:6]]
     summary = "\n".join([
-        f"期間：{stats.get('period', '本月')}",
+        f"期間：{stats.get('period', '最近一個月')}",
         f"登記：{stats.get('count', 0)} 筆",
         f"合計：${float(stats.get('total', 0)):g}",
         f"待撥款：{stats.get('pendingCount', 0)} 筆／${float(stats.get('pendingTotal', 0)):g}",
         f"已領款：{stats.get('paidCount', 0)} 筆／${float(stats.get('paidTotal', 0)):g}",
+        *( ["", "專案分類：", *project_lines] if project_lines else [] ),
     ])
     return {"type": "flex", "altText": "我的代墊統計", "contents": {"type": "bubble", "header": {"type": "box", "layout": "vertical", "backgroundColor": "#17365D", "contents": [{"type": "text", "text": "我的代墊統計", "color": "#FFFFFF", "weight": "bold"}]}, "body": {"type": "box", "layout": "vertical", "contents": [{"type": "text", "text": summary, "wrap": True}]}}}
 
@@ -775,7 +799,7 @@ def get_recent_open_projects(context: str = "") -> list[dict[str, Any]]:
 
 def build_project_or_missing_prompt(session: dict[str, Any], missing: list[str]) -> dict[str, Any]:
     """依缺漏欄位顯示可直接完成或取消的操作圖卡。"""
-    project_label = "專案名稱（沒有專案請寫「專案無」）"
+    project_label = "專案名稱"
     if project_label in missing:
         context = " ".join([
             str(session.get("raw_text") or ""),
@@ -853,13 +877,30 @@ def build_expense_confirmation(data: dict[str, Any]) -> dict[str, Any]:
             "body": {"type": "box", "layout": "vertical", "contents": body_contents},
             "footer": {"type": "box", "layout": "vertical", "contents": [
                 {"type": "button", "style": "primary", "action": {"type": "postback", "label": "確認送出", "data": "expense:confirm", "displayText": "確認送出"}},
-                {"type": "button", "action": {"type": "postback", "label": "修改", "data": "expense:modify", "displayText": "修改代墊資料"}},
-                {"type": "button", "action": {"type": "postback", "label": "更換專案", "data": "expense:change_project", "displayText": "更換專案"}},
-                {"type": "button", "action": {"type": "postback", "label": "重新拍攝", "data": "expense:retake", "displayText": "重新拍攝收據"}},
+                {"type": "button", "action": {"type": "postback", "label": "送出並連續登記", "data": "expense:confirm_continuous", "displayText": "送出並連續登記"}},
+                {"type": "button", "action": {"type": "postback", "label": "修改資料", "data": "expense:modify", "displayText": "修改代墊資料"}},
                 {"type": "button", "action": {"type": "postback", "label": "取消登記", "data": "expense:cancel", "displayText": "取消登記"}},
             ]},
         },
     }
+
+
+def expense_modify_card() -> dict[str, Any]:
+    """集中顯示可修改欄位，避免確認卡堆滿按鈕。"""
+    labels = [
+        ("專案名稱", "project"), ("費用分類", "category"), ("消費內容", "item"),
+        ("金額", "amount"), ("日期", "date"), ("重新拍攝單據", "retake"),
+    ]
+    buttons = [{"type": "button", "height": "sm", "margin": "sm", "action": {
+        "type": "postback", "label": label, "data": f"expense:edit:{field}", "displayText": label,
+    }} for label, field in labels]
+    buttons.append({"type": "button", "height": "sm", "margin": "sm", "action": {
+        "type": "postback", "label": "返回確認資料", "data": "expense:edit:back", "displayText": "返回確認資料",
+    }})
+    return {"type": "flex", "altText": "選擇要修改的內容", "contents": {"type": "bubble",
+        "header": {"type": "box", "layout": "vertical", "backgroundColor": "#17365D", "contents": [{"type": "text", "text": "選擇要修改的內容", "color": "#FFFFFF", "weight": "bold"}]},
+        "body": {"type": "box", "layout": "vertical", "contents": buttons},
+    }}
 
 
 def expense_result_card(data: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
@@ -868,22 +909,26 @@ def expense_result_card(data: dict[str, Any], result: dict[str, Any]) -> dict[st
     record_url = str(result.get("recordUrl") or "").strip()
     title = "這張單據已登記過" if duplicate else "代墊登記完成"
     original = result.get("original") if isinstance(result.get("original"), dict) else {}
+    continuous = bool(result.get("continuous"))
     text = "\n".join([
         "這張單據可能已由其他人登記。",
         f"日期：{original.get('date', '')}", f"專案：{original.get('project', '')}",
         f"金額：${original.get('amount', '')}", f"登記人：{original.get('registrantName', '')}",
     ]) if duplicate else "\n".join([
         f"專案：{data.get('project', '')}", f"項目：{data.get('item', '')}",
-        f"金額：${data.get('amount', '')}", "收據：已儲存", "15 分鐘內可直接傳下一張收據。",
+        f"金額：${data.get('amount', '')}", f"收據：{'已儲存' if result.get('receiptUrl') else '待補件'}",
+        *( ["15 分鐘內可直接傳下一張收據。"] if continuous else [] ),
     ])
     actions: list[dict[str, Any]] = []
     if record_url.startswith("https://"):
         actions.append({"type": "uri", "label": "查看登記資料" if not duplicate else "查看前次紀錄", "uri": record_url})
-    if not duplicate:
+    if not duplicate and continuous:
         actions.append({"type": "postback", "label": "登記下一筆", "data": "expense:new", "displayText": "登記下一筆代墊"})
         actions.append({"type": "postback", "label": "結束連續代墊", "data": "expense:end_batch", "displayText": "結束連續代墊"})
-    else:
-        actions.append({"type": "postback", "label": "取消", "data": "expense:cancel", "displayText": "取消"})
+    elif duplicate:
+        duplicate_row = int(result.get("row") or 0)
+        actions.append({"type": "postback", "label": "確認不是同一筆", "data": f"expense:duplicate_override:{duplicate_row}", "displayText": "確認不是同一筆"})
+        actions.append({"type": "postback", "label": "取消本次登記", "data": "expense:cancel", "displayText": "取消本次登記"})
     return {"type": "template", "altText": title, "template": {"type": "buttons", "title": title, "text": text[:160], "actions": actions}}
 
 
@@ -1062,6 +1107,11 @@ def receipt_analysis_to_expense(
     if warnings:
         note_parts.append("辨識提醒：" + "；".join(map(str, warnings[:3])))
 
+    semantic_signature = "|".join([
+        re.sub(r"\W", "", invoice_number).upper(), expense_date,
+        str(int(amount) if amount is not None and amount.is_integer() else amount or ""),
+        re.sub(r"\s+", "", merchant).casefold(), re.sub(r"\s+", "", item_detail).casefold(),
+    ])
     data: dict[str, Any] = {
         "registrantUserId": user_id,
         "date": expense_date,
@@ -1077,6 +1127,7 @@ def receipt_analysis_to_expense(
         "companyTaxIdValid": company_tax_id_valid,
         "companyTaxId": COMPANY_TAX_ID if company_tax_id_valid else "",
         "invoiceNumber": invoice_number,
+        "merchantName": merchant,
         "note": "；".join(note_parts) or "影像收據自動辨識",
         "receiptBase64": image_base64,
         "receiptMimeType": mime_type,
@@ -1084,6 +1135,7 @@ def receipt_analysis_to_expense(
         "receiptConfidence": confidence,
         "receiptSecondPass": bool(analysis.get("usedSecondPass")),
         "receiptHash": hashlib.sha256(image_base64.encode("ascii")).hexdigest(),
+        "receiptSignature": hashlib.sha256(semantic_signature.encode("utf-8")).hexdigest(),
     }
     if not company_tax_id_valid:
         data["note"] = (data["note"] + "；未填寫公司統編").strip("；")
@@ -1133,6 +1185,11 @@ def submit_expense(data: dict[str, Any]) -> dict[str, Any]:
     payload = response.json()
     if not payload.get("ok"):
         raise requests.RequestException("expense api rejected the update")
+    if not payload.get("duplicate"):
+        if not payload.get("row") or not payload.get("transactionId"):
+            raise requests.RequestException("expense api returned incomplete write confirmation")
+        if data.get("receiptBase64") and not str(payload.get("receiptUrl") or "").startswith("https://"):
+            raise requests.RequestException("expense receipt was not stored")
     return payload
 
 
@@ -1327,14 +1384,7 @@ async def webhook(request: Request):
             if action == "project":
                 if value in {"manual", "search"}:
                     session["step"] = "project_search"
-                    reply_text(reply_token, "請輸入專案關鍵字或完整專案名稱；沒有專案請輸入「專案無」。")
-                    continue
-                if value == "none":
-                    session["data"]["project"] = "專案無"
-                    session.pop("project_candidates", None)
-                    missing = missing_expense_fields(session["data"])
-                    session["step"] = "quick_missing" if missing else "quick_confirm"
-                    reply_messages(reply_token, [build_project_or_missing_prompt(session, missing) if missing else build_expense_confirmation(session["data"])])
+                    reply_text(reply_token, "請輸入專案關鍵字或完整專案名稱。")
                     continue
                 try:
                     project = session.get("project_candidates", [])[int(value)]
@@ -1371,11 +1421,12 @@ async def webhook(request: Request):
                 session["step"] = step_order[action]
             elif action == "receipt" and value == "略過收據":
                 session["step"] = "note"
-            elif action == "confirm":
+            elif action in {"confirm", "confirm_continuous"}:
                 if session.get("submitting"):
                     reply_text(reply_token, "這筆資料正在送出，請勿重複點擊。")
                     continue
                 session["submitting"] = True
+                session["continuous"] = action == "confirm_continuous"
                 try:
                     session["data"]["registrantName"] = get_line_profile_name(user_id)
                     result = submit_expense(session["data"])
@@ -1383,8 +1434,14 @@ async def webhook(request: Request):
                     session["submitting"] = False
                     reply_text(reply_token, "目前無法寫入支出資料，內容已保留，請稍後再按一次「確認送出」。")
                     continue
+                if result.get("duplicate"):
+                    session["submitting"] = False
+                    session["duplicateRow"] = result.get("row")
+                    reply_messages(reply_token, [expense_result_card(session["data"], result)])
+                    continue
                 EXPENSE_SESSIONS.pop(user_id, None)
-                if not result.get("duplicate"):
+                result["continuous"] = bool(session.get("continuous"))
+                if session.get("continuous"):
                     batch = EXPENSE_BATCHES.setdefault(user_id, {"project": session["data"].get("project", ""), "count": 0, "total": 0.0, "notes": [], "hashes": [], "recordUrls": []})
                     batch["project"] = session["data"].get("project", batch.get("project", ""))
                     batch["count"] += 1
@@ -1408,7 +1465,41 @@ async def webhook(request: Request):
                 continue
             elif action == "modify":
                 session["step"] = "quick_edit"
-                reply_text(reply_token, "請直接說要修改的內容，例如：「金額改成 950，發票改為有統編」。")
+                reply_messages(reply_token, [expense_modify_card()])
+                continue
+            elif action == "edit":
+                edit_prompts = {
+                    "project": ("project_manual", "請輸入正確的專案名稱。"),
+                    "category": ("quick_edit", "請輸入正確的費用分類。"),
+                    "item": ("quick_edit", "請輸入正確的消費內容。"),
+                    "amount": ("quick_edit", "請輸入正確金額，例如：950。"),
+                    "date": ("quick_edit", "請輸入正確日期，例如：2026/08/09。"),
+                }
+                if value == "back":
+                    session["step"] = "quick_confirm"
+                    reply_messages(reply_token, [build_expense_confirmation(session["data"])])
+                    continue
+                if value == "retake":
+                    EXPENSE_SESSIONS[user_id] = {"step": "receipt_waiting_image", "updated_at": time.time(), "data": session["data"]}
+                    reply_text(reply_token, "請重新上傳一張完整、清楚且避免反光的收據或發票照片。")
+                    continue
+                session["step"], prompt = edit_prompts.get(value, ("quick_edit", "請直接輸入要修改的內容。"))
+                reply_text(reply_token, prompt)
+                continue
+            elif action == "duplicate_override":
+                session["data"]["duplicateOverride"] = True
+                session["data"]["duplicateOriginalRow"] = int(value or 0)
+                session["data"]["duplicateOverrideBy"] = user_id
+                session["data"]["transactionId"] = uuid.uuid4().hex
+                session["submitting"] = True
+                try:
+                    result = submit_expense(session["data"])
+                except requests.RequestException:
+                    session["submitting"] = False
+                    reply_text(reply_token, "目前無法完成重複放行，資料已保留，請稍後再試。")
+                    continue
+                EXPENSE_SESSIONS.pop(user_id, None)
+                reply_messages(reply_token, [expense_result_card(session["data"], result)])
                 continue
             elif action == "retake":
                 EXPENSE_SESSIONS[user_id] = {
@@ -1440,6 +1531,7 @@ async def webhook(request: Request):
                 continue
 
             if session and session.get("step") == "supplement_image":
+                start_loading(user_id)
                 try:
                     data, _ = process_receipt_image(user_id, receipt_base64, receipt_mime)
                     result = submit_supplement(
@@ -1463,6 +1555,7 @@ async def webhook(request: Request):
                     reply_text(reply_token, "這張單據剛剛已處理過，沒有重複建立。")
                     continue
                 try:
+                    start_loading(user_id)
                     data, missing = process_receipt_image(user_id, receipt_base64, receipt_mime)
                 except ValueError:
                     reply_text(reply_token, "這張圖片不像發票或收據，因此沒有啟動代墊登記。")
@@ -1480,6 +1573,7 @@ async def webhook(request: Request):
             # 已先輸入「代墊」時，收到圖片就立即進行辨識。
             if session and session.get("step") == "receipt_waiting_image":
                 try:
+                    start_loading(user_id)
                     data, missing = process_receipt_image(user_id, receipt_base64, receipt_mime)
                 except ValueError as error:
                     reply_text(reply_token, str(error))
@@ -1503,16 +1597,20 @@ async def webhook(request: Request):
                 reply_messages(reply_token, [build_project_or_missing_prompt(EXPENSE_SESSIONS[user_id], missing) if missing else build_expense_confirmation(data)])
                 continue
 
-            # 員工先上傳圖片時先保留，等收到「代墊」才傳送至辨識服務。
+            # 員工直接上傳圖片時立即啟動辨識，不要求再輸入一次「代墊」。
             if not session:
-                EXPENSE_SESSIONS[user_id] = {
-                    "step": "receipt_waiting_trigger",
-                    "updated_at": time.time(),
-                    "receiptBase64": receipt_base64,
-                    "receiptMimeType": receipt_mime,
-                    "data": {"registrantUserId": user_id},
-                }
-                reply_text(reply_token, "已收到單據照片。請輸入「代墊」，我會自動辨識並填寫。")
+                try:
+                    start_loading(user_id)
+                    data, missing = process_receipt_image(user_id, receipt_base64, receipt_mime)
+                except ValueError:
+                    reply_text(reply_token, "這張圖片目前無法確認為代墊單據，請重新拍攝清楚完整的收據或發票。")
+                    continue
+                except requests.RequestException:
+                    reply_text(reply_token, "目前無法辨識單據，請稍後重新上傳。")
+                    continue
+                new_session = {"step": "quick_missing" if missing else "quick_confirm", "updated_at": time.time(), "raw_text": "", "data": data}
+                EXPENSE_SESSIONS[user_id] = new_session
+                reply_messages(reply_token, [build_project_or_missing_prompt(new_session, missing) if missing else build_expense_confirmation(data)])
                 continue
 
             if session.get("step") not in {"receipt", "quick_confirm", "quick_missing", "quick_edit"}:
@@ -1551,7 +1649,7 @@ async def webhook(request: Request):
             reply_text(reply_token, "補件完成。" if result.get("complete") else "已更新，仍有其他資料需要補件。")
             continue
 
-        if source.get("type") == "user" and user_id in INTERNAL_USER_IDS and command in {"我的待補件", "待補件", "查詢待補件"}:
+        if source.get("type") == "user" and user_id in INTERNAL_USER_IDS and looks_like_supplement_query(text):
             try:
                 reply_messages(reply_token, [supplement_list_card(get_supplements(user_id))])
             except requests.RequestException:
@@ -1667,14 +1765,17 @@ async def webhook(request: Request):
         if session:
             step = session["step"]
             if step in {"project", "project_manual", "project_search"}:
-                if step == "project_search" and text not in {"無", "沒有", "無專案", "專案無"}:
+                if step == "project_search":
                     candidates = session.get("project_candidates", [])
                     matched = [project for project in candidates if text.casefold() in str(project.get("name", "")).casefold()]
                     if matched:
                         session["project_candidates"] = matched
                         reply_messages(reply_token, [project_candidate_card(matched)])
                         continue
-                session["data"]["project"] = "專案無" if text in {"無", "沒有", "無專案", "專案無"} else text
+                if text in {"無", "沒有", "無專案", "專案無"}:
+                    reply_text(reply_token, "每筆代墊都需要專案名稱，請輸入專案名稱。")
+                    continue
+                session["data"]["project"] = text
                 if step in {"project_manual", "project_search"}:
                     missing = missing_expense_fields(session["data"])
                     session["step"] = "quick_missing" if missing else "quick_confirm"
