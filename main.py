@@ -10,6 +10,7 @@ import os
 import re
 import time
 import uuid
+from contextvars import ContextVar
 from datetime import datetime, timedelta
 from typing import Any
 from urllib.parse import parse_qs
@@ -19,7 +20,7 @@ import requests
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-APP_RELEASE = "2026-08-09-expense-v12"
+APP_RELEASE = "2026-08-09-expense-v13"
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 GROUP_REGISTRY_URL = os.environ.get("GROUP_REGISTRY_URL", "").rstrip("/")
@@ -84,6 +85,13 @@ EXPENSE_ITEM_OPTIONS = [
 ]
 TAIPEI_TZ = ZoneInfo("Asia/Taipei")
 LOGGER = logging.getLogger("aurtor-line-bot")
+
+# 保存目前 Webhook 事件資訊，讓既有回覆呼叫能在 Reply Token 逾時時安全改用 Push。
+CURRENT_LINE_USER_ID: ContextVar[str] = ContextVar("current_line_user_id", default="")
+CURRENT_LINE_SOURCE_TYPE: ContextVar[str] = ContextVar("current_line_source_type", default="")
+CURRENT_WEBHOOK_EVENT_ID: ContextVar[str] = ContextVar("current_webhook_event_id", default="")
+DELIVERED_LINE_EVENTS: dict[str, float] = {}
+DELIVERED_EVENT_TTL_SECONDS = 30 * 60
 
 # 專案狀態會由不同系統提供，統一轉成小寫後排除已結束項目。
 CLOSED_PROJECT_STATUSES = {
@@ -198,15 +206,66 @@ def line_headers() -> dict[str, str]:
     }
 
 
-def reply_messages(reply_token: str, messages: list[dict[str, Any]]) -> None:
-    """使用事件的 Reply Token 回覆一或多則 LINE 訊息。"""
+def purge_delivered_line_events() -> None:
+    """移除過期事件，避免 Render 記憶體持續累積。"""
+    cutoff = time.time() - DELIVERED_EVENT_TTL_SECONDS
+    for event_id, delivered_at in list(DELIVERED_LINE_EVENTS.items()):
+        if delivered_at < cutoff:
+            DELIVERED_LINE_EVENTS.pop(event_id, None)
+
+
+def push_messages(user_id: str, messages: list[dict[str, Any]]) -> None:
+    """Reply Token 已失效時，將相同內容 Push 至原本的員工個人聊天室。"""
     response = requests.post(
-        "https://api.line.me/v2/bot/message/reply",
+        "https://api.line.me/v2/bot/message/push",
         headers=line_headers(),
-        json={"replyToken": reply_token, "messages": messages},
+        json={"to": user_id, "messages": messages},
         timeout=10,
     )
     response.raise_for_status()
+
+
+def should_fallback_to_push(error: requests.RequestException) -> bool:
+    """只對逾時、連線錯誤、Reply Token 失效或 LINE 暫時異常啟用備援。"""
+    if isinstance(error, (requests.Timeout, requests.ConnectionError)):
+        return True
+    response = getattr(error, "response", None)
+    if response is None:
+        return False
+    return response.status_code in {400, 408, 409, 410, 429, 500, 502, 503, 504}
+
+
+def reply_messages(reply_token: str, messages: list[dict[str, Any]]) -> None:
+    """優先使用 Reply API；逾時時僅對內部員工個人聊天室改用 Push。"""
+    event_id = CURRENT_WEBHOOK_EVENT_ID.get()
+    user_id = CURRENT_LINE_USER_ID.get()
+    source_type = CURRENT_LINE_SOURCE_TYPE.get()
+    purge_delivered_line_events()
+    if event_id and event_id in DELIVERED_LINE_EVENTS:
+        LOGGER.info("略過已送達的 LINE 重送事件：%s", event_id)
+        return
+
+    try:
+        response = requests.post(
+            "https://api.line.me/v2/bot/message/reply",
+            headers=line_headers(),
+            json={"replyToken": reply_token, "messages": messages},
+            timeout=10,
+        )
+        response.raise_for_status()
+    except requests.RequestException as error:
+        can_push = (
+            source_type == "user"
+            and user_id in INTERNAL_USER_IDS
+            and should_fallback_to_push(error)
+        )
+        if not can_push:
+            raise
+        LOGGER.warning("LINE Reply 失敗，改用 Push 備援：%s", type(error).__name__)
+        push_messages(user_id, messages)
+
+    if event_id:
+        DELIVERED_LINE_EVENTS[event_id] = time.time()
 
 
 def reply_text(reply_token: str, text: str) -> None:
@@ -1320,6 +1379,16 @@ async def webhook(request: Request):
         source = event.get("source", {})
         user_id = source.get("userId", "")
         reply_token = event.get("replyToken", "")
+        event_id = str(event.get("webhookEventId") or "")
+
+        # LINE 可能因 Webhook 回應延遲而重送同一事件；已成功回覆的事件不得再次執行。
+        purge_delivered_line_events()
+        if event_id and event_id in DELIVERED_LINE_EVENTS:
+            LOGGER.info("忽略 LINE 重送事件：%s", event_id)
+            continue
+        CURRENT_LINE_USER_ID.set(user_id)
+        CURRENT_LINE_SOURCE_TYPE.set(str(source.get("type") or ""))
+        CURRENT_WEBHOOK_EVENT_ID.set(event_id)
 
         # 代墊登記只允許已登記成員在 Bot 個人聊天室操作。
         if event.get("type") == "postback" and source.get("type") == "user":
