@@ -82,7 +82,10 @@ function expenseDiagnostics_() {
 function authorizeExpenseDrive() {
   const sheet = SpreadsheetApp.openById(EXPENSE_SHEET_ID_).getSheetByName(EXPENSE_SHEET_NAME_);
   const folder = DriveApp.getFolderById(EXPENSE_RECEIPT_FOLDER_ID_);
-  return { sheet: sheet.getName(), folder: folder.getName() };
+  // 實際建立並移除暫存檔，確保授權包含 Drive 寫入，而不只是讀取資料夾。
+  const authFile = folder.createFile(Utilities.newBlob('authorization test', 'text/plain', 'AURTOR授權測試.txt'));
+  authFile.setTrashed(true);
+  return { sheet: sheet.getName(), folder: folder.getName(), writeAuthorized: true };
 }
 
 function saveExpense_(expense) {
