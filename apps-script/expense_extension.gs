@@ -2,6 +2,8 @@
 const EXPENSE_SHEET_ID_ = '1cwpPt50hlC3OH2tOKQGA7DVv4-qwuMgrLir6AoyU7CM';
 const EXPENSE_SHEET_NAME_ = '表單回應 1';
 const COMPANY_TAX_ID_ = '90531465';
+// 固定收據資料夾，避免不同執行環境重複建立資料夾。
+const EXPENSE_RECEIPT_FOLDER_ID_ = '1eKu-z-Qap95Mh6wG7ufKscY1Kh7RPVyy';
 
 function doGet(e) {
   if (!authorized_(e)) return json_({ ok: false, error: 'unauthorized' });
@@ -20,15 +22,25 @@ function doPost(e) {
 }
 
 function saveExpense_(expense) {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(25000)) return json_({ ok: false, error: 'expense_write_busy' });
+  try {
+    return saveExpenseLocked_(expense);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function saveExpenseLocked_(expense) {
   const sheet = SpreadsheetApp.openById(EXPENSE_SHEET_ID_).getSheetByName(EXPENSE_SHEET_NAME_);
   if (!sheet) return json_({ ok: false, error: 'expense_sheet_not_found' });
   ensureExpenseMetadataHeaders_(sheet);
 
   const transactionId = String(expense.transactionId || '').trim();
   const invoiceNumber = String(expense.invoiceNumber || '').replace(/[^0-9A-Za-z]/g, '').toUpperCase();
-  const duplicateRow = findDuplicateExpense_(sheet, expense, transactionId, invoiceNumber);
+  const duplicateRow = expense.duplicateOverride === true ? 0 : findDuplicateExpense_(sheet, expense, transactionId, invoiceNumber);
   if (duplicateRow) {
-    const original = sheet.getRange(duplicateRow, 1, 1, Math.max(24, sheet.getLastColumn())).getValues()[0];
+    const original = sheet.getRange(duplicateRow, 1, 1, Math.max(29, sheet.getLastColumn())).getValues()[0];
     return json_({ ok: true, duplicate: true, row: duplicateRow, recordUrl: expenseRecordUrl_(sheet, duplicateRow), original: { date: normalizeExpenseDate_(original[2]), project: String(original[12] || ''), amount: Number(original[5] || 0), registrantName: String(original[14] || original[6] || '') } });
   }
 
@@ -44,9 +56,11 @@ function saveExpense_(expense) {
     expense.registrantName || '', transactionId, invoiceNumber,
     expense.companyTaxIdValid === true ? '正確' : '未填公司統編', expense.registrantUserId || '',
     expense.receiptHash || '', supplementStatus, missingReasons.join('、'), '', supplementStatus === '資料完整' ? now : '',
+    expense.merchantName || '', expense.receiptSignature || '', expense.duplicateOverride === true ? Number(expense.duplicateOriginalRow || 0) : '',
+    expense.duplicateOverride === true ? String(expense.duplicateOverrideBy || '') : '', expense.duplicateOverride === true ? now : '',
   ]);
   const row = sheet.getLastRow();
-  return json_({ ok: true, duplicate: false, row: row, receiptUrl: receiptUrl, recordUrl: expenseRecordUrl_(sheet, row) });
+  return json_({ ok: true, duplicate: false, row: row, transactionId: transactionId, receiptUrl: receiptUrl, recordUrl: expenseRecordUrl_(sheet, row), supplementStatus: supplementStatus });
 }
 
 function expenseMissingReasons_(expense) {
@@ -63,7 +77,7 @@ function supplementList_(payer, userId) {
   const sheet = SpreadsheetApp.openById(EXPENSE_SHEET_ID_).getSheetByName(EXPENSE_SHEET_NAME_);
   if (!sheet) return json_({ ok: false, error: 'expense_sheet_not_found' });
   ensureExpenseMetadataHeaders_(sheet);
-  const rows = sheet.getLastRow() < 2 ? [] : sheet.getRange(2, 1, sheet.getLastRow() - 1, Math.max(24, sheet.getLastColumn())).getValues();
+  const rows = sheet.getLastRow() < 2 ? [] : sheet.getRange(2, 1, sheet.getLastRow() - 1, Math.max(29, sheet.getLastColumn())).getValues();
   const items = [];
   for (let index = rows.length - 1; index >= 0 && items.length < 10; index--) {
     const row = rows[index];
@@ -79,7 +93,7 @@ function updateSupplement_(input) {
   const rowNumber = Number(input.row || 0);
   if (!sheet || rowNumber < 2 || rowNumber > sheet.getLastRow()) return json_({ ok: false, error: 'record_not_found' });
   ensureExpenseMetadataHeaders_(sheet);
-  const row = sheet.getRange(rowNumber, 1, 1, Math.max(24, sheet.getLastColumn())).getValues()[0];
+  const row = sheet.getRange(rowNumber, 1, 1, Math.max(29, sheet.getLastColumn())).getValues()[0];
   const belongs = String(row[18] || '').trim() ? String(row[18] || '').trim() === String(input.userId || '').trim() : String(row[6] || '').trim() === String(input.payer || '').trim();
   if (!belongs) return json_({ ok: false, error: 'forbidden' });
   let reasons = String(row[21] || '').split('、').filter(String);
@@ -107,10 +121,15 @@ function expenseStats_(payer, userId) {
   if (!sheet) return json_({ ok: false, error: 'expense_sheet_not_found' });
   const now = new Date();
   const timezone = Session.getScriptTimeZone() || 'Asia/Taipei';
-  const period = Utilities.formatDate(now, timezone, 'yyyy-MM');
+  const start = new Date(now.getTime());
+  start.setMonth(start.getMonth() - 1);
+  const startDate = Utilities.formatDate(start, timezone, 'yyyy-MM-dd');
+  const endDate = Utilities.formatDate(now, timezone, 'yyyy-MM-dd');
+  const period = startDate + '～' + endDate;
   // 使用顯示值解析舊版表單時間，避免試算表地區格式讓 Date 轉換失敗。
-  const rows = sheet.getLastRow() < 2 ? [] : sheet.getRange(2, 1, sheet.getLastRow() - 1, Math.max(24, sheet.getLastColumn())).getDisplayValues();
+  const rows = sheet.getLastRow() < 2 ? [] : sheet.getRange(2, 1, sheet.getLastRow() - 1, Math.max(29, sheet.getLastColumn())).getDisplayValues();
   let count = 0, total = 0, pendingCount = 0, pendingTotal = 0, paidCount = 0, paidTotal = 0;
+  const projectTotals = {};
   rows.forEach(function(row) {
     // 新資料優先比對 LINE User ID；舊資料則兼容「支出人」與「登記人」欄位。
     const lineUserId = String(row[18] || '').trim();
@@ -118,17 +137,23 @@ function expenseStats_(payer, userId) {
     const belongsToUser = lineUserId
       ? lineUserId === userId
       : String(row[6] || '').trim() === payer || legacyRegistrant.indexOf(userId) >= 0 || legacyRegistrant.indexOf(payer) >= 0;
-    if (!belongsToUser || normalizeExpenseDate_(row[0]).slice(0, 7) !== period) return;
+    const registeredDate = normalizeExpenseDate_(row[0]);
+    if (!belongsToUser || !registeredDate || registeredDate < startDate || registeredDate > endDate) return;
     const amount = Number(String(row[5] || 0).replace(/,/g, '')) || 0;
     count += 1; total += amount;
+    const project = String(row[12] || '未分類').trim() || '未分類';
+    if (!projectTotals[project]) projectTotals[project] = { project: project, count: 0, total: 0 };
+    projectTotals[project].count += 1;
+    projectTotals[project].total += amount;
     if (String(row[8] || '').trim() === '是') { paidCount += 1; paidTotal += amount; }
     else { pendingCount += 1; pendingTotal += amount; }
   });
-  return json_({ ok: true, period: period, count: count, total: total, pendingCount: pendingCount, pendingTotal: pendingTotal, paidCount: paidCount, paidTotal: paidTotal });
+  const projects = Object.keys(projectTotals).map(function(key) { return projectTotals[key]; }).sort(function(a, b) { return b.total - a.total; });
+  return json_({ ok: true, period: period, count: count, total: total, pendingCount: pendingCount, pendingTotal: pendingTotal, paidCount: paidCount, paidTotal: paidTotal, projects: projects });
 }
 
 function ensureExpenseMetadataHeaders_(sheet) {
-  const headers = ['交易識別碼', '發票號碼', '統編狀態', 'LINE User ID', '圖片指紋', '補件狀態', '缺漏原因', '最後補件時間', '補件完成時間'];
+  const headers = ['交易識別碼', '發票號碼', '統編狀態', 'LINE User ID', '圖片指紋', '補件狀態', '缺漏原因', '最後補件時間', '補件完成時間', '商家名稱', '單據語意指紋', '重複放行原資料列', '重複放行人', '重複放行時間'];
   const range = sheet.getRange(1, 16, 1, headers.length);
   const current = range.getValues()[0];
   range.setValues([headers.map(function(header, index) { return current[index] || header; })]);
@@ -138,7 +163,7 @@ function ensureExpenseMetadataHeaders_(sheet) {
 function backfillSupplementStatus_(sheet) {
   const lastRow = sheet.getLastRow();
   if (lastRow < 2) return;
-  const rows = sheet.getRange(2, 1, lastRow - 1, Math.max(24, sheet.getLastColumn())).getValues();
+  const rows = sheet.getRange(2, 1, lastRow - 1, Math.max(29, sheet.getLastColumn())).getValues();
   const output = rows.map(function(row) {
     if (String(row[20] || '').trim()) return [row[20], row[21]];
     const reasons = [];
@@ -154,40 +179,34 @@ function backfillSupplementStatus_(sheet) {
 function findDuplicateExpense_(sheet, expense, transactionId, invoiceNumber) {
   const lastRow = sheet.getLastRow();
   if (lastRow < 2) return 0;
-  const values = sheet.getRange(2, 1, lastRow - 1, Math.max(24, sheet.getLastColumn())).getValues();
+  const values = sheet.getRange(2, 1, lastRow - 1, Math.max(29, sheet.getLastColumn())).getValues();
   const targetDate = normalizeExpenseDate_(expense.date);
   const targetAmount = Number(expense.amount || 0);
   const targetHash = String(expense.receiptHash || '').trim();
+  const targetSignature = String(expense.receiptSignature || '').trim();
+  const targetMerchant = String(expense.merchantName || '').replace(/\s+/g, '').toLowerCase();
   for (let index = values.length - 1; index >= 0; index--) {
     const row = values[index];
     if (transactionId && String(row[15] || '') === transactionId) return index + 2;
     if (targetHash && String(row[19] || '').trim() === targetHash) return index + 2;
-    if (!invoiceNumber || String(row[16] || '').replace(/[^0-9A-Za-z]/g, '').toUpperCase() !== invoiceNumber) continue;
-    if (normalizeExpenseDate_(row[2]) === targetDate && Number(String(row[5]).replace(/,/g, '')) === targetAmount) {
+    if (targetSignature && String(row[25] || '').trim() === targetSignature) return index + 2;
+    const sameDateAmount = normalizeExpenseDate_(row[2]) === targetDate && Number(String(row[5]).replace(/,/g, '')) === targetAmount;
+    const rowInvoice = String(row[16] || '').replace(/[^0-9A-Za-z]/g, '').toUpperCase();
+    const rowMerchant = String(row[24] || '').replace(/\s+/g, '').toLowerCase();
+    if (sameDateAmount && invoiceNumber && rowInvoice === invoiceNumber) {
       return index + 2;
     }
+    if (sameDateAmount && targetMerchant && rowMerchant && targetMerchant === rowMerchant) return index + 2;
   }
   return 0;
 }
 
 function saveExpenseReceipt_(expense) {
   if (!expense.receiptBase64) return '';
-  const properties = PropertiesService.getScriptProperties();
-  const configuredFolderId = properties.getProperty('EXPENSE_RECEIPT_FOLDER_ID');
-  const folder = configuredFolderId ? DriveApp.getFolderById(configuredFolderId) : getOrCreateExpenseFolder_();
+  const folder = DriveApp.getFolderById(EXPENSE_RECEIPT_FOLDER_ID_);
   const bytes = Utilities.base64Decode(expense.receiptBase64);
   const blob = Utilities.newBlob(bytes, expense.receiptMimeType || 'image/jpeg', expense.receiptFileName || 'receipt.jpg');
   return folder.createFile(blob).getUrl();
-}
-
-function getOrCreateExpenseFolder_() {
-  const properties = PropertiesService.getScriptProperties();
-  const savedId = properties.getProperty('EXPENSE_RECEIPT_FOLDER_ID');
-  if (savedId) return DriveApp.getFolderById(savedId);
-  const folders = DriveApp.getFoldersByName('AURTOR 代墊單據');
-  const folder = folders.hasNext() ? folders.next() : DriveApp.createFolder('AURTOR 代墊單據');
-  properties.setProperty('EXPENSE_RECEIPT_FOLDER_ID', folder.getId());
-  return folder;
 }
 
 function expenseRecordUrl_(sheet, row) {
