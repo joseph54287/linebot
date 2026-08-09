@@ -19,7 +19,7 @@ import requests
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-APP_RELEASE = "2026-08-09-expense-v10"
+APP_RELEASE = "2026-08-09-expense-v11"
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 GROUP_REGISTRY_URL = os.environ.get("GROUP_REGISTRY_URL", "").rstrip("/")
@@ -449,6 +449,19 @@ def infer_item_option(text: str) -> str:
     return best if scores[best] > 0 else ""
 
 
+def infer_expense_content(text: str, item: str = "") -> str:
+    """保留員工實際花費內容，與公司大項分類分開。"""
+    labeled = extract_labeled_value(text, FIELD_LABELS["item"])
+    if labeled:
+        return labeled
+    folded = text.casefold()
+    if any(word in folded for word in ["加油", "汽油", "油資", "燃料", "中油", "台塑"]):
+        return "加油／汽油費"
+    if "柴油" in folded:
+        return "柴油費"
+    return item
+
+
 def infer_payer(text: str, user_id: str) -> str:
     """優先採用文字指定的付款人，否則使用訊息傳送者。"""
     aliases = {
@@ -525,6 +538,7 @@ def parse_expense_text(text: str, user_id: str) -> tuple[dict[str, Any], list[st
     amount = infer_amount(text)
     project, raw_item = infer_project_and_item(text, amount)
     item = infer_item_option(" ".join([raw_item, text]))
+    expense_content = infer_expense_content(text, raw_item or item)
     expense_date = parse_expense_date(text)
     data: dict[str, Any] = {
         "registrantUserId": user_id,
@@ -532,13 +546,17 @@ def parse_expense_text(text: str, user_id: str) -> tuple[dict[str, Any], list[st
         "month": str(int(expense_date[5:7])),
         "project": project,
         "item": item,
+        "expenseContent": expense_content,
         "amount": amount,
         "category": infer_category(" ".join([raw_item, text])) or (PROJECT_EXPENSE_CATEGORY if item else ""),
         "payer": infer_payer(text, user_id),
         "payment": "已支出",
         "reimbursed": "是" if re.search(r"已領(?:到)?款", text) else "否",
         "invoice": "是" if re.search(r"有統編|含統編|統編發票", text) else "未開",
-        "note": "未附收據" if re.search(r"沒收據|無收據", text) else "無",
+        "note": "；".join(filter(None, [
+            f"消費內容：{expense_content}" if expense_content else "",
+            "未附收據" if re.search(r"沒收據|無收據", text) else "",
+        ])) or "無",
     }
     return data, missing_expense_fields(data)
 
@@ -550,7 +568,7 @@ def merge_expense_text(existing: dict[str, Any], text: str, user_id: str) -> dic
         return parsed
     merged = dict(existing)
 
-    for field in ["project", "item", "amount", "category"]:
+    for field in ["project", "item", "expenseContent", "amount", "category"]:
         if parsed.get(field) not in {None, ""}:
             merged[field] = parsed[field]
 
@@ -580,7 +598,6 @@ def missing_expense_fields(data: dict[str, Any]) -> list[str]:
         "project": "專案名稱",
         "item": "消費項目",
         "amount": "金額",
-        "category": "項目分類或更清楚的消費內容",
         "payer": "支出人",
     }
     missing = [label for field, label in required.items() if data.get(field) in {None, ""}]
@@ -856,6 +873,7 @@ def build_expense_confirmation(data: dict[str, Any]) -> dict[str, Any]:
         f"日期：{data.get('date', '')}",
         f"專案：{data.get('project', '')}",
         f"項目：{data.get('item', '')}",
+        f"內容：{data.get('expenseContent') or data.get('item', '')}",
         f"金額：${data.get('amount', '')}",
         f"支出人：{data.get('payer', '')}",
         f"付款：{data.get('payment', '')}",
