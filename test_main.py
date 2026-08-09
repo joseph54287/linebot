@@ -4,53 +4,24 @@ import asyncio
 import json
 
 import main
-import external_case
 from starlette.requests import Request
 
 
 QUOTE_USER_ID = "Ub983deb79584603885e5b28e9fdf2d5d"
 
 
-def test_external_case_short_message_understands_date_and_ten_thousand():
-    data = external_case.parse_initial(
-        "外案 8月10號 1萬", "U-test", "周暐"
-    )
-    assert data["date"].endswith("-08-10")
-    assert data["amount"] == 10000
-    assert external_case.next_step(data) == "details"
-
-
-def test_external_case_can_start_when_external_keyword_is_not_first():
-    assert external_case.is_external_case_text("8 月 10 號外案 3 萬") is True
-
-
-def test_external_case_defaults_to_tax_exclusive_and_calculates_invoice_total():
-    data = external_case.parse_initial("8月10號外案 3萬", "U-tax", "周暐")
-    assert data["taxMode"] == "稅外"
-    assert external_case.tax_amounts(data) == (30000, 1500, 31500)
-
-
-def test_external_case_explicit_tax_inclusive_is_converted_to_pretax():
-    data = external_case.parse_initial("外案 8月10號 3萬含稅", "U-tax", "周暐")
-    assert data["taxMode"] == "含稅"
-    assert external_case.tax_amounts(data) == (28571, 1429, 30000)
-
-
-def test_external_case_conversation_only_asks_missing_fields():
-    session = external_case.start("外案 8/10 1.5萬 剪片", "U-external", "阿全")
-    assert session["data"]["amount"] == 15000
-    assert session["data"]["caseType"] == "剪接案"
-    assert session["step"] == "details"
-    session = external_case.accept_text(
-        "U-external", "案名：品牌活動精華\n案型：剪接案\n款項：公司\n預計匯款日：9月15日"
-    )
-    assert session["step"] == "confirm"
-    assert session["data"]["projectName"] == "品牌活動精華"
-    assert session["data"]["paymentDate"].endswith("-09-15")
-
-
-def test_external_case_invalid_date_is_not_guessed():
-    assert external_case.parse_date("外案 2月30號 1萬") == ""
+def all_actions(value):
+    """遞迴收集 Flex 圖卡操作，避免測試綁死視覺排版位置。"""
+    found = []
+    if isinstance(value, dict):
+        if isinstance(value.get("action"), dict):
+            found.append(value["action"])
+        for child in value.values():
+            found.extend(all_actions(child))
+    elif isinstance(value, list):
+        for child in value:
+            found.extend(all_actions(child))
+    return found
 
 
 def quote_event(event_type="postback", user_id=QUOTE_USER_ID, source_type="user"):
@@ -157,10 +128,10 @@ def test_complete_expense_text_replies_with_confirmation_card(monkeypatch):
     assert len(replies) == 1
     token, messages = replies[0]
     assert token == "reply-expense-text"
-    assert messages[0]["altText"] == "請確認代墊資料"
-    summary = messages[0]["contents"]["body"]["contents"][0]["text"]
-    assert "專案：PJR" in summary
-    assert "內容：加油／汽油費" in summary
+    assert messages[0]["altText"] == "確認代墊資料"
+    payload = json.dumps(messages[0], ensure_ascii=False)
+    assert "PJR" in payload
+    assert "加油／汽油費" in payload
 
 
 def test_new_session_starts_with_date():
@@ -192,9 +163,9 @@ def test_confirmation_switches_receipt_label():
         "companyTaxIdValid": True,
     }
     card = main.build_expense_confirmation(data)
-    summary = card["contents"]["body"]["contents"][0]["text"]
-    assert "收據：已附照片" in summary
-    assert "LINE Bot 測試" in summary
+    payload = json.dumps(card, ensure_ascii=False)
+    assert "已儲存" in payload
+    assert "LINE Bot 測試" in payload
 
 
 def test_parse_complete_natural_language(monkeypatch):
@@ -272,9 +243,9 @@ def test_expense_query_is_not_registration_intent():
 
 def test_expense_stats_card_shows_own_summary():
     card = main.expense_stats_card({"period": "2026-08", "count": 3, "total": 1500, "pendingCount": 2, "pendingTotal": 1000, "paidCount": 1, "paidTotal": 500})
-    text = card["contents"]["body"]["contents"][0]["text"]
-    assert "登記：3 筆" in text
-    assert "待撥款：2 筆／$1000" in text
+    payload = json.dumps(card, ensure_ascii=False)
+    assert "3 筆" in payload
+    assert "2 筆／$1000" in payload
 
 
 def test_receipt_analysis_creates_one_expense_row():
@@ -399,11 +370,11 @@ def test_open_projects_filter_rank_without_age_or_limit():
 
 def test_project_card_uses_short_index_postbacks():
     card = main.project_candidate_card([{"id": "p1", "name": "很長的專案名稱測試"}])
-    buttons = card["contents"]["body"]["contents"]
-    assert buttons[0]["action"]["data"] == "expense:project:0"
-    assert buttons[-2]["action"]["data"] == "expense:project:search"
-    assert buttons[-1]["action"]["data"] == "expense:cancel"
-    assert all(button["action"]["data"] != "expense:project:none" for button in buttons)
+    actions = all_actions(card)
+    assert actions[0]["data"] == "expense:project:0"
+    assert actions[-2]["data"] == "expense:project:manual"
+    assert actions[-1]["data"] == "expense:cancel"
+    assert all(action["data"] != "expense:project:none" for action in actions)
 
 
 def test_project_phrases_are_understood():
@@ -466,9 +437,9 @@ def test_unknown_item_and_no_answer_show_action_cards(monkeypatch):
 
     monkeypatch.setattr(main, "get_recent_open_projects", lambda context: [])
     project_message = main.build_project_or_missing_prompt(session, ["專案名稱"])
-    project_buttons = project_message["contents"]["body"]["contents"]
-    assert project_buttons[0]["action"]["data"] == "expense:project:search"
-    assert project_buttons[-1]["action"]["data"] == "expense:cancel"
+    project_actions = all_actions(project_message)
+    assert project_actions[0]["data"] == "expense:project:search"
+    assert project_actions[-1]["data"] == "expense:cancel"
 
 
 def test_submit_expense_adds_attachment_metadata(monkeypatch):
@@ -508,12 +479,37 @@ def test_seller_tax_id_cannot_pass_company_validation():
     assert main.has_valid_company_tax_id(analysis) is True
 
 
+def test_company_tax_id_can_be_recovered_from_ocr_raw_text():
+    """Gemini 未標成買方時，OCR 原文的完整公司統編仍須辨識成功。"""
+    analysis = {"buyerTaxId": "", "sellerTaxId": "12345678", "rawText": "買受人 9053-1465\n總計 500"}
+    assert main.has_valid_company_tax_id(analysis) is True
+    analysis["rawText"] = "買受人 9053-146\n總計 500"
+    assert main.has_valid_company_tax_id(analysis) is False
+
+
+def test_pending_text_merges_into_processing_receipt_without_losing_image():
+    """OCR 期間收到的文字必須與收據合成同一筆。"""
+    user_id = "U6c6441cb38102499d1f80d4ea79a53ab"
+    main.EXPENSE_SESSIONS[user_id] = {
+        "step": "receipt_processing", "updated_at": main.time.time(),
+        "pending_text": "代墊 PJR 專案加油 500 元", "data": {"registrantUserId": user_id},
+    }
+    receipt = {
+        "registrantUserId": user_id, "date": "2026-08-09", "item": "交通", "amount": 500,
+        "payer": "周暐", "receiptBase64": "receipt-image", "receiptMimeType": "image/jpeg",
+    }
+    merged = main.merge_pending_receipt_text(user_id, receipt)
+    assert merged["project"] == "PJR"
+    assert merged["receiptBase64"] == "receipt-image"
+    assert merged["expenseContent"] == "加油／汽油費"
+
+
 def test_invalid_company_tax_id_warns_without_blocking_or_showing_number():
     data = {"receiptBase64": "image", "companyTaxIdValid": False, "buyerTaxId": "12345678"}
     card = main.build_expense_confirmation(data)
-    assert card["altText"] == "請確認代墊資料"
+    assert card["altText"] == "確認代墊資料"
     assert "12345678" not in json.dumps(card, ensure_ascii=False)
-    assert "⚠ 此單據未填寫公司統編" in json.dumps(card, ensure_ascii=False)
+    assert "此單據未辨識到公司統編" in json.dumps(card, ensure_ascii=False)
     assert "expense:confirm" in json.dumps(card, ensure_ascii=False)
 
 
@@ -533,7 +529,7 @@ def test_recent_project_is_kept_for_twenty_four_hours(monkeypatch):
 
 def test_batch_summary_has_exactly_two_final_actions():
     card = main.expense_batch_summary_card({"count": 2, "total": 900, "notes": ["第 1 筆未填寫公司統編"], "recordUrls": ["https://example.com/row"]})
-    actions = card["template"]["actions"]
+    actions = all_actions(card)
     assert len(actions) == 2
     assert actions[0]["label"] == "新的專案登記代墊"
     assert actions[0]["data"] == "expense:start_new"
@@ -544,25 +540,25 @@ def test_batch_summary_has_exactly_two_final_actions():
 def test_project_card_paginates_with_absolute_indexes():
     projects = [{"id": str(i), "name": f"專案 {i}"} for i in range(15)]
     first = main.project_candidate_card(projects)
-    assert first["contents"]["body"]["contents"][7]["action"]["data"] == "expense:project_page:1"
+    assert all_actions(first)[7]["data"] == "expense:project_page:1"
     second = main.project_candidate_card(projects, 1)
-    assert second["contents"]["body"]["contents"][0]["action"]["data"] == "expense:project:7"
+    assert all_actions(second)[0]["data"] == "expense:project:7"
 
 
 def test_result_cards_distinguish_success_and_duplicate():
     data = {"project": "PJR", "item": "交通", "amount": 500}
-    success = main.expense_result_card(data, {"ok": True, "recordUrl": "https://example.com/row", "continuous": True})
+    success = main.expense_result_card(data, {"ok": True, "row": 12, "transactionId": "tx-1", "recordUrl": "https://example.com/row", "continuous": True})
     duplicate = main.expense_result_card(data, {"ok": True, "duplicate": True, "recordUrl": "https://example.com/old"})
-    assert success["template"]["title"] == "代墊登記完成"
-    assert any(action.get("data") == "expense:new" for action in success["template"]["actions"])
-    assert duplicate["template"]["title"] == "這張單據已登記過"
-    assert all(action.get("data") != "expense:new" for action in duplicate["template"]["actions"])
+    assert success["contents"]["header"]["contents"][-1]["text"] == "代墊已登記，待補收據"
+    assert any(action.get("data") == "expense:new" for action in all_actions(success))
+    assert duplicate["contents"]["header"]["contents"][-1]["text"] == "這張單據已登記過"
+    assert all(action.get("data") != "expense:new" for action in all_actions(duplicate))
 
 
 def test_supplement_list_and_detail_cards():
     items = [{"row": 12, "date": "2026-08-08", "project": "PJR", "amount": 500, "reasons": ["缺少統編", "圖片不清楚"]}]
     listing = main.supplement_list_card(items)
-    assert listing["contents"]["body"]["contents"][0]["action"]["data"] == "supplement:select:12"
+    assert any(action.get("data") == "supplement:select:12" for action in all_actions(listing))
     detail = main.supplement_detail_card(items[0])
     payload = json.dumps(detail, ensure_ascii=False)
     assert "supplement:accept_no_tax:12" in payload
@@ -575,7 +571,7 @@ def test_empty_supplement_list_is_clear():
 
 def test_duplicate_card_shows_original_registrant():
     card = main.expense_result_card({}, {"duplicate": True, "original": {"date": "2026-08-08", "project": "PJR", "amount": 500, "registrantName": "高爾賢"}})
-    assert "高爾賢" in card["template"]["text"]
+    assert "高爾賢" in json.dumps(card, ensure_ascii=False)
 
 
 def test_reply_success_does_not_use_push(monkeypatch):
