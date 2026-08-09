@@ -84,6 +84,42 @@ def test_mixed_quote_batch_keeps_existing_event(monkeypatch):
     assert replies == [("reply-my-id", "User ID：U-other")]
 
 
+def test_complete_expense_text_replies_with_confirmation_card(monkeypatch):
+    """完整文字代墊必須直接回複確認圖卡，不能靜默或改走圖片流程。"""
+    user_id = "U6c6441cb38102499d1f80d4ea79a53ab"
+    payload = {"events": [{
+        "type": "message", "replyToken": "reply-expense-text",
+        "source": {"type": "user", "userId": user_id},
+        "message": {"type": "text", "text": "代墊 PJR 專案加油汽油費 500 元"},
+    }]}
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    replies = []
+    monkeypatch.setattr(main, "verify_signature", lambda raw, signature: True)
+    monkeypatch.setattr(main, "reply_messages", lambda token, messages: replies.append((token, messages)))
+    main.EXPENSE_SESSIONS.pop(user_id, None)
+    delivered = False
+
+    async def receive():
+        nonlocal delivered
+        if delivered:
+            return {"type": "http.disconnect"}
+        delivered = True
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    request = Request({
+        "type": "http", "method": "POST", "path": "/webhook",
+        "headers": [(b"x-line-signature", b"test")],
+    }, receive)
+    assert asyncio.run(main.webhook(request)) == {"status": "ok"}
+    assert len(replies) == 1
+    token, messages = replies[0]
+    assert token == "reply-expense-text"
+    assert messages[0]["altText"] == "請確認代墊資料"
+    summary = messages[0]["contents"]["body"]["contents"][0]["text"]
+    assert "專案：PJR" in summary
+    assert "內容：加油／汽油費" in summary
+
+
 def test_new_session_starts_with_date():
     session = main.new_expense_session("U-test")
     assert session["step"] == "date"
@@ -497,3 +533,81 @@ def test_empty_supplement_list_is_clear():
 def test_duplicate_card_shows_original_registrant():
     card = main.expense_result_card({}, {"duplicate": True, "original": {"date": "2026-08-08", "project": "PJR", "amount": 500, "registrantName": "高爾賢"}})
     assert "高爾賢" in card["template"]["text"]
+
+
+def test_reply_success_does_not_use_push(monkeypatch):
+    """Reply 正常成功時不得額外消耗 Push 額度。"""
+    calls = []
+
+    class Response:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+    monkeypatch.setattr(main.requests, "post", lambda url, **kwargs: calls.append((url, kwargs)) or Response())
+    main.DELIVERED_LINE_EVENTS.clear()
+    main.CURRENT_LINE_USER_ID.set("U6c6441cb38102499d1f80d4ea79a53ab")
+    main.CURRENT_LINE_SOURCE_TYPE.set("user")
+    main.CURRENT_WEBHOOK_EVENT_ID.set("evt-reply-ok")
+
+    messages = [{"type": "text", "text": "測試成功"}]
+    main.reply_messages("valid-reply-token", messages)
+
+    assert len(calls) == 1
+    assert calls[0][0].endswith("/reply")
+    assert calls[0][1]["json"]["messages"] == messages
+    assert "evt-reply-ok" in main.DELIVERED_LINE_EVENTS
+
+
+def test_expired_reply_token_falls_back_to_push(monkeypatch):
+    """Reply Token 逾時後，內部員工仍須收到完全相同的 Push 訊息。"""
+    calls = []
+
+    class ReplyExpiredResponse:
+        status_code = 400
+
+        def raise_for_status(self):
+            error = main.requests.HTTPError("invalid reply token")
+            error.response = self
+            raise error
+
+    class PushSuccessResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+    def fake_post(url, **kwargs):
+        calls.append((url, kwargs))
+        return ReplyExpiredResponse() if url.endswith("/reply") else PushSuccessResponse()
+
+    monkeypatch.setattr(main.requests, "post", fake_post)
+    main.DELIVERED_LINE_EVENTS.clear()
+    user_id = "U6c6441cb38102499d1f80d4ea79a53ab"
+    main.CURRENT_LINE_USER_ID.set(user_id)
+    main.CURRENT_LINE_SOURCE_TYPE.set("user")
+    main.CURRENT_WEBHOOK_EVENT_ID.set("evt-push-fallback")
+
+    messages = [{"type": "text", "text": "備援成功"}]
+    main.reply_messages("expired-reply-token", messages)
+
+    assert [call[0].rsplit("/", 1)[-1] for call in calls] == ["reply", "push"]
+    assert calls[1][1]["json"] == {"to": user_id, "messages": messages}
+    assert "evt-push-fallback" in main.DELIVERED_LINE_EVENTS
+
+
+def test_delivered_webhook_event_is_not_sent_twice(monkeypatch):
+    """LINE 重送同一 webhookEventId 時，不得再次回覆或重做登記。"""
+    monkeypatch.setattr(
+        main.requests,
+        "post",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("不應再次呼叫 LINE API")),
+    )
+    main.DELIVERED_LINE_EVENTS.clear()
+    main.DELIVERED_LINE_EVENTS["evt-already-delivered"] = main.time.time()
+    main.CURRENT_LINE_USER_ID.set("U6c6441cb38102499d1f80d4ea79a53ab")
+    main.CURRENT_LINE_SOURCE_TYPE.set("user")
+    main.CURRENT_WEBHOOK_EVENT_ID.set("evt-already-delivered")
+
+    main.reply_text("replayed-token", "不應重送")
