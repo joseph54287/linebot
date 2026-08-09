@@ -19,7 +19,7 @@ import requests
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-APP_RELEASE = "2026-08-09-expense-v11"
+APP_RELEASE = "2026-08-09-expense-v12"
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 GROUP_REGISTRY_URL = os.environ.get("GROUP_REGISTRY_URL", "").rstrip("/")
@@ -501,15 +501,15 @@ def infer_amount(text: str) -> int | float | None:
 
 def infer_project_and_item(text: str, amount: int | float | None) -> tuple[str, str]:
     """從明確標籤或常見口語結構辨識專案與消費項目。"""
-    project = extract_labeled_value(text, FIELD_LABELS["project"])
+    project = ""
     item = extract_labeled_value(text, FIELD_LABELS["item"])
     # 同時支援「PJR 專案」與「這個專案是 MG50」等自然說法。
-    project_suffix = re.search(r"(?:^|[，,、；;\s])([A-Za-z0-9][A-Za-z0-9_-]{1,39})\s*(?:專案|案件)(?:$|[，,、；;\s])", text, re.IGNORECASE)
-    project_sentence = re.search(r"(?:這個|本次|這筆)?\s*(?:專案|案件)\s*(?:是|為|改成|改為|叫)?\s*[：:]?\s*([A-Za-z0-9][A-Za-z0-9_-]{1,39})", text, re.IGNORECASE)
-    if project_sentence:
-        project = project_sentence.group(1)
-    elif project_suffix:
+    project_suffix = re.search(r"(?:^|[^A-Za-z0-9_-])([A-Za-z0-9][A-Za-z0-9_-]{1,39})\s*(?:專案|案件)", text, re.IGNORECASE)
+    project_sentence = re.search(r"(?:這個|本次|這筆)?\s*(?:專案|案件)\s*(?:是|為|改成|改為|叫|[：:])\s*([A-Za-z0-9][A-Za-z0-9_-]{1,39})", text, re.IGNORECASE)
+    if project_suffix:
         project = project_suffix.group(1)
+    elif project_sentence:
+        project = project_sentence.group(1)
     project = re.sub(r"^(?:是|為|改成|改為|叫)\s*", "", project).strip()
     cleaned = re.sub(r"^(?:我要|我想)?\s*(?:登記)?\s*代墊\s*", "", text, flags=re.IGNORECASE)
     cleaned = re.sub(r"(?:今天|昨天|昨日|前天|明天)", "", cleaned)
@@ -1203,7 +1203,8 @@ def submit_expense(data: dict[str, Any]) -> dict[str, Any]:
     response.raise_for_status()
     payload = response.json()
     if not payload.get("ok"):
-        raise requests.RequestException("expense api rejected the update")
+        error_code = re.sub(r"[^0-9A-Za-z_-]", "", str(payload.get("error") or "expense_api_rejected"))[:80]
+        raise requests.RequestException(error_code or "expense_api_rejected")
     if not payload.get("duplicate"):
         if not payload.get("row") or not payload.get("transactionId"):
             raise requests.RequestException("expense api returned incomplete write confirmation")
@@ -1449,9 +1450,11 @@ async def webhook(request: Request):
                 try:
                     session["data"]["registrantName"] = get_line_profile_name(user_id)
                     result = submit_expense(session["data"])
-                except requests.RequestException:
+                except requests.RequestException as error:
                     session["submitting"] = False
-                    reply_text(reply_token, "目前無法寫入支出資料，內容已保留，請稍後再按一次「確認送出」。")
+                    error_code = str(error) or "unknown"
+                    LOGGER.exception("代墊寫入失敗 code=%s", error_code)
+                    reply_text(reply_token, f"目前無法寫入支出資料（錯誤：{error_code[:40]}），內容已保留，請稍後再按一次「確認送出」。")
                     continue
                 if result.get("duplicate"):
                     session["submitting"] = False
