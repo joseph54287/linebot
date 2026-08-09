@@ -21,7 +21,7 @@ import requests
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-APP_RELEASE = "2026-08-09-expense-v16-text-image-link"
+APP_RELEASE = "2026-08-09-expense-v15"
 import external_case
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
@@ -57,7 +57,7 @@ OWNER_USER_ID = os.environ.get(
 )
 # 外案最終核准人固定為高爾賢的 LINE 帳號；避免其他系統的 OWNER_USER_ID 誤導核准通知。
 EXTERNAL_CASE_OWNER_USER_ID = "Ub983deb79584603885e5b28e9fdf2d5d"
-EXTERNAL_CASE_TEST_MODE = True
+EXTERNAL_CASE_TEST_MODE = False
 DEFAULT_INTERNAL_USER_IDS = (
     "U6c6441cb38102499d1f80d4ea79a53ab,"
     "Ub983deb79584603885e5b28e9fdf2d5d,"
