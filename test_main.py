@@ -158,6 +158,7 @@ def test_fuel_text_keeps_category_and_human_readable_content():
     )
     assert missing == []
     assert data["item"] == "交通"
+    assert data["project"] == "PJR"
     assert data["expenseContent"] == "加油／汽油費"
     assert "消費內容：加油／汽油費" in data["note"]
 
