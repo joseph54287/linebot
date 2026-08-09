@@ -136,7 +136,9 @@ def test_external_case_approval_owner_is_kao_er_hsien():
 def test_external_case_owner_card_has_confirm_and_discuss_only():
     data = external_case.parse_initial("8月10號外案8萬", QUOTE_USER_ID, "爾賢")
     data.update({"projectName": "BWS", "caseType": "導演案", "destination": "公司", "paymentDate": "2026-09-15", "contact": "王小姐"})
-    actions = external_case.approval_card(data)["template"]["actions"]
+    card = external_case.approval_card(data)
+    assert card["type"] == "flex"
+    actions = [button["action"] for button in card["contents"]["footer"]["contents"]]
     assert [(action["label"], action["data"].split(":")[1]) for action in actions] == [
         ("確認成立", "approve"), ("待討論", "discuss"),
     ]
@@ -281,7 +283,7 @@ def test_owner_self_submission_replies_with_pending_status_and_approval_card(mon
     request = Request({"type": "http", "method": "POST", "path": "/webhook", "headers": [(b"x-line-signature", b"test")]}, receive)
     assert asyncio.run(main.webhook(request)) == {"status": "ok"}
     assert replies[-1][0]["text"].startswith("已送出，現在是「待核准」")
-    assert [action["label"] for action in replies[-1][1]["template"]["actions"]] == ["確認成立", "待討論"]
+    assert [button["action"]["label"] for button in replies[-1][1]["contents"]["footer"]["contents"]] == ["確認成立", "待討論"]
 
 
 def all_actions(value):
