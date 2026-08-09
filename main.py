@@ -21,6 +21,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 APP_RELEASE = "2026-08-09-expense-v14"
+import external_case
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 GROUP_REGISTRY_URL = os.environ.get("GROUP_REGISTRY_URL", "").rstrip("/")
@@ -31,6 +32,8 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 RECEIPT_VISION_MODEL = os.environ.get("RECEIPT_VISION_MODEL", "gemini-3.6-flash")
 PROJECT_API_URL = os.environ.get("PROJECT_API_URL", "").rstrip("/")
 PROJECT_API_KEY = os.environ.get("PROJECT_API_KEY", "")
+BONUS_API_URL = os.environ.get("BONUS_API_URL", "").rstrip("/")
+BONUS_API_KEY = os.environ.get("BONUS_API_KEY", "")
 QUOTE_WEBHOOK_URL = os.environ.get(
     "QUOTE_WEBHOOK_URL",
     "https://linebot-bam2.onrender.com/webhook",
@@ -115,6 +118,12 @@ INTERNAL_USER_NAMES = {
     "U6c6441cb38102499d1f80d4ea79a53ab": "周暐",
     "Ub983deb79584603885e5b28e9fdf2d5d": "高爾賢",
     "U9478b00702c716685d9d8b021d62d538": "阿全",
+}
+# 獎金表使用的正式姓名必須與 COUNTIF 關鍵字完全一致。
+EXTERNAL_CASE_NAMES = {
+    "U6c6441cb38102499d1f80d4ea79a53ab": "周暐",
+    "Ub983deb79584603885e5b28e9fdf2d5d": "爾賢",
+    "U9478b00702c716685d9d8b021d62d538": "阿筌",
 }
 
 CATEGORY_KEYWORDS = {
@@ -445,6 +454,12 @@ def start_loading(user_id: str, seconds: int = 60) -> None:
         response.raise_for_status()
     except requests.RequestException:
         LOGGER.warning("無法顯示 LINE 載入動畫")
+
+
+def external_next_message(session: dict[str, Any]) -> dict[str, Any]:
+    if session["step"] == "confirm":
+        return external_case.confirmation_card(session["data"])
+    return external_case.prompt(session["step"])
 
 
 def ui_header(title: str, eyebrow: str = "") -> dict[str, Any]:
@@ -1590,6 +1605,61 @@ async def webhook(request: Request):
         CURRENT_LINE_SOURCE_TYPE.set(str(source.get("type") or ""))
         CURRENT_WEBHOOK_EVENT_ID.set(event_id)
 
+        # 外案申請獨立於代墊流程：主管核准成功後才寫入獎金表。
+        if event.get("type") == "postback" and source.get("type") == "user":
+            raw_external = event.get("postback", {}).get("data", "")
+            if raw_external.startswith("external:"):
+                parts = raw_external.split(":", 3)
+                action = parts[1] if len(parts) > 1 else ""
+                if action == "cancel":
+                    external_case.SESSIONS.pop(user_id, None)
+                    reply_text(reply_token, "好，這筆外案先不送出。")
+                    continue
+                if action == "set" and len(parts) == 4:
+                    session = external_case.accept_option(user_id, parts[2], parts[3])
+                    if not session:
+                        reply_text(reply_token, "這筆外案已逾時，請重新輸入「外案」。")
+                    else:
+                        reply_messages(reply_token, [external_next_message(session)])
+                    continue
+                if action == "submit":
+                    session = external_case.get_session(user_id)
+                    if not session or session["step"] != "confirm":
+                        reply_text(reply_token, "資料還沒完整，請重新輸入「外案」。")
+                        continue
+                    try:
+                        external_case.api_call(BONUS_API_URL, BONUS_API_KEY, {"action": "submit", "data": session["data"]})
+                        push_messages(OWNER_USER_ID, [external_case.approval_card(session["data"])])
+                    except requests.RequestException:
+                        reply_text(reply_token, "目前無法送出核准，內容還在，請稍後再按一次。")
+                        continue
+                    external_case.SESSIONS.pop(user_id, None)
+                    reply_text(reply_token, "已送出，現在是「待核准」。\n有結果我會通知你。")
+                    continue
+                if action in {"approve", "reject"} and len(parts) >= 3:
+                    if user_id != OWNER_USER_ID:
+                        reply_text(reply_token, "這個操作只有核准人可以執行。")
+                        continue
+                    request_id = parts[2]
+                    try:
+                        result = external_case.api_call(BONUS_API_URL, BONUS_API_KEY, {
+                            "action": action, "requestId": request_id, "approverUserId": user_id,
+                        })
+                    except requests.RequestException:
+                        reply_text(reply_token, "目前無法完成處理，這筆尚未登記，請稍後再試。")
+                        continue
+                    applicant_id = str(result.get("employeeUserId") or "")
+                    project_name = str(result.get("projectName") or "這筆外案")
+                    if action == "approve":
+                        reply_text(reply_token, "已核准，並完成登記。")
+                        if applicant_id:
+                            push_messages(applicant_id, [{"type": "text", "text": f"你的外案「{project_name}」已經核准，並完成登記。"}])
+                    else:
+                        reply_text(reply_token, "已拒絕這筆外案。")
+                        if applicant_id:
+                            push_messages(applicant_id, [{"type": "text", "text": f"你的外案「{project_name}」沒有通過。"}])
+                    continue
+
         # 代墊登記只允許已登記成員在 Bot 個人聊天室操作。
         if event.get("type") == "postback" and source.get("type") == "user":
             if user_id not in INTERNAL_USER_IDS:
@@ -2025,6 +2095,22 @@ async def webhook(request: Request):
                 reply_messages(reply_token, [expense_stats_card(stats)])
             except requests.RequestException:
                 reply_text(reply_token, "目前無法讀取代墊統計，請稍後再試；本次沒有建立代墊紀錄。")
+            continue
+
+        # 可直接理解「8月10號外案3萬」等自然語序，再一次補問其餘資料。
+        if source.get("type") == "user" and external_case.is_external_case_text(text):
+            if user_id not in INTERNAL_USER_IDS:
+                reply_text(reply_token, "你的帳號尚未加入公司內部登記名單。")
+                continue
+            employee_name = EXTERNAL_CASE_NAMES.get(user_id) or get_line_profile_name(user_id)
+            session = external_case.start(text, user_id, employee_name)
+            reply_messages(reply_token, [external_next_message(session)])
+            continue
+
+        external_session = external_case.get_session(user_id) if source.get("type") == "user" else None
+        if external_session and external_session.get("step") != "confirm":
+            session = external_case.accept_text(user_id, text)
+            reply_messages(reply_token, [external_next_message(session)])
             continue
 
         # 圖片後直接輸入「代墊 PJR 專案」時，同時啟動 OCR 並累積本句資料。
