@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import asyncio
 import hashlib
 import hmac
 import logging
@@ -76,6 +77,8 @@ app = FastAPI(title="AURTOR LINE Bot")
 # Render 只暫存尚未送出的對話；完成、取消或逾時後立即清除。
 EXPENSE_SESSIONS: dict[str, dict[str, Any]] = {}
 SESSION_TTL_SECONDS = 30 * 60
+TEXT_RECEIPT_LINK_SECONDS = 5 * 60
+EXPENSE_USER_LOCKS: dict[str, asyncio.Lock] = {}
 # 完成第一筆後保留專案 15 分鐘，讓員工可連續上傳整疊單據。
 EXPENSE_BATCHES: dict[str, dict[str, Any]] = {}
 BATCH_TTL_SECONDS = 15 * 60
@@ -1003,6 +1006,72 @@ def submit_supplement(user_id: str, row: int, **updates: Any) -> dict[str, Any]:
     return payload
 
 
+def expense_draft_api(action: str, user_id: str, session: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    """以 Apps Script 持久保存短效文字草稿；失敗時由記憶體流程繼續。"""
+    if not EXPENSE_API_URL or not EXPENSE_API_KEY:
+        return None
+    body: dict[str, Any] = {"action": f"expense_draft_{action}", "userId": user_id}
+    if session is not None:
+        body["session"] = session
+    try:
+        response = requests.post(EXPENSE_API_URL, params={"key": EXPENSE_API_KEY}, json=body, timeout=10)
+        response.raise_for_status()
+        payload = response.json()
+        return payload if isinstance(payload, dict) and payload.get("ok") else None
+    except (requests.RequestException, ValueError):
+        LOGGER.warning("expense draft persistence failed action=%s", action)
+        return None
+
+
+def save_expense_draft(user_id: str, session: dict[str, Any]) -> None:
+    expense_draft_api("save", user_id, session)
+
+
+def load_expense_draft(user_id: str) -> dict[str, Any] | None:
+    payload = expense_draft_api("get", user_id)
+    session = payload.get("session") if payload else None
+    if not isinstance(session, dict) or float(session.get("linkExpiresAt") or 0) < time.time():
+        return None
+    return session
+
+
+def delete_expense_draft(user_id: str) -> None:
+    expense_draft_api("delete", user_id)
+
+
+def activate_text_receipt_link(user_id: str, session: dict[str, Any]) -> dict[str, Any]:
+    """完整文字草稿開啟五分鐘收據綁定窗；一人同時只保留這一筆。"""
+    session["sourceMode"] = "text"
+    session["draftId"] = uuid.uuid4().hex
+    session["linkExpiresAt"] = time.time() + TEXT_RECEIPT_LINK_SECONDS
+    session["attachmentLocked"] = False
+    session.setdefault("data", {})["registrantUserId"] = user_id
+    return session
+
+
+def attach_receipt_to_text_session(
+    session: dict[str, Any], receipt_base64: str, receipt_mime: str, *, now: float | None = None
+) -> str:
+    """將第一張收據綁定到完整文字草稿；不讓 OCR 覆蓋員工輸入資料。"""
+    current_time = time.time() if now is None else now
+    if session.get("sourceMode") != "text" or float(session.get("linkExpiresAt") or 0) < current_time:
+        return "not_applicable"
+    data = session.setdefault("data", {})
+    incoming_hash = hashlib.sha256(receipt_base64.encode("ascii")).hexdigest()
+    existing_hash = str(data.get("receiptHash") or "")
+    if existing_hash:
+        return "duplicate" if existing_hash == incoming_hash else "locked"
+    data["receiptBase64"] = receipt_base64
+    data["receiptMimeType"] = receipt_mime
+    data["receiptHash"] = incoming_hash
+    data["companyTaxIdStatus"] = "pending_manual"
+    data["note"] = (str(data.get("note") or "") + "；文字後補傳收據已自動綁定，未重新辨識內容").strip("；")
+    session["attachmentLocked"] = True
+    session["step"] = "quick_confirm"
+    session["updated_at"] = current_time
+    return "attached"
+
+
 def supplement_list_card(items: list[dict[str, Any]]) -> dict[str, Any]:
     """列出最多十筆待補件資料。"""
     if not items:
@@ -1785,6 +1854,7 @@ async def webhook(request: Request):
                     row = 0
                 if action == "cancel":
                     EXPENSE_SESSIONS.pop(user_id, None)
+                    await asyncio.to_thread(delete_expense_draft, user_id)
                     reply_text(reply_token, "已取消補件。")
                     continue
                 if action == "select":
@@ -1812,6 +1882,7 @@ async def webhook(request: Request):
             session = get_expense_session(user_id)
             if raw_data == "expense:cancel":
                 EXPENSE_SESSIONS.pop(user_id, None)
+                await asyncio.to_thread(delete_expense_draft, user_id)
                 reply_text(reply_token, "本次代墊登記已取消。")
                 continue
             if raw_data == "expense:new":
@@ -1914,7 +1985,7 @@ async def webhook(request: Request):
                 session["continuous"] = action == "confirm_continuous"
                 try:
                     session["data"]["registrantName"] = get_line_profile_name(user_id)
-                    result = submit_expense(session["data"])
+                    result = await asyncio.to_thread(submit_expense, session["data"])
                 except requests.RequestException as error:
                     session["submitting"] = False
                     error_code = str(error) or "unknown"
@@ -1927,6 +1998,7 @@ async def webhook(request: Request):
                     reply_messages(reply_token, [expense_result_card(session["data"], result)])
                     continue
                 EXPENSE_SESSIONS.pop(user_id, None)
+                await asyncio.to_thread(delete_expense_draft, user_id)
                 result["continuous"] = bool(session.get("continuous"))
                 if session.get("continuous"):
                     batch = EXPENSE_BATCHES.setdefault(user_id, {"project": session["data"].get("project", ""), "count": 0, "total": 0.0, "notes": [], "hashes": [], "recordUrls": []})
@@ -1981,12 +2053,13 @@ async def webhook(request: Request):
                 session["data"]["transactionId"] = uuid.uuid4().hex
                 session["submitting"] = True
                 try:
-                    result = submit_expense(session["data"])
+                    result = await asyncio.to_thread(submit_expense, session["data"])
                 except requests.RequestException:
                     session["submitting"] = False
                     reply_text(reply_token, "目前無法完成重複放行，資料已保留，請稍後再試。")
                     continue
                 EXPENSE_SESSIONS.pop(user_id, None)
+                await asyncio.to_thread(delete_expense_draft, user_id)
                 reply_messages(reply_token, [expense_result_card(session["data"], result)])
                 continue
             elif action == "retake":
@@ -2012,16 +2085,34 @@ async def webhook(request: Request):
             if user_id not in INTERNAL_USER_IDS:
                 continue
             session = get_expense_session(user_id)
+            if not session:
+                restored = await asyncio.to_thread(load_expense_draft, user_id)
+                if restored:
+                    EXPENSE_SESSIONS[user_id] = restored
+                    session = restored
             try:
                 receipt_base64, receipt_mime = download_line_image(message.get("id", ""))
             except requests.RequestException:
                 reply_text(reply_token, "收據照片讀取失敗，請重新傳送一次。")
                 continue
 
+            # 完整代墊文字後 5 分鐘內的第一張照片，自動合併且完全保留文字欄位。
+            if session and session.get("sourceMode") == "text" and float(session.get("linkExpiresAt") or 0) >= time.time():
+                user_lock = EXPENSE_USER_LOCKS.setdefault(user_id, asyncio.Lock())
+                async with user_lock:
+                    session = get_expense_session(user_id) or session
+                    link_result = attach_receipt_to_text_session(session, receipt_base64, receipt_mime)
+                    if link_result in {"duplicate", "locked"}:
+                        reply_text(reply_token, "這筆代墊已綁定收據；重複照片已忽略。" if link_result == "duplicate" else "這筆代墊已綁定另一張收據，不會自動覆蓋。")
+                        continue
+                    await asyncio.to_thread(delete_expense_draft, user_id)
+                reply_messages(reply_token, [build_expense_confirmation(session["data"])])
+                continue
+
             if session and session.get("step") == "supplement_image":
                 start_loading(user_id)
                 try:
-                    data, _ = process_receipt_image(user_id, receipt_base64, receipt_mime)
+                    data, _ = await asyncio.to_thread(process_receipt_image, user_id, receipt_base64, receipt_mime)
                     result = submit_supplement(
                         user_id, int(session.get("supplement_row") or 0),
                         receiptBase64=receipt_base64, receiptMimeType=receipt_mime,
@@ -2045,7 +2136,7 @@ async def webhook(request: Request):
                 try:
                     start_loading(user_id)
                     EXPENSE_SESSIONS[user_id] = {"step": "receipt_processing", "updated_at": time.time(), "pending_text": "", "data": {"registrantUserId": user_id, "project": batch.get("project", "")}}
-                    data, missing = process_receipt_image(user_id, receipt_base64, receipt_mime)
+                    data, missing = await asyncio.to_thread(process_receipt_image, user_id, receipt_base64, receipt_mime)
                 except ValueError:
                     EXPENSE_SESSIONS.pop(user_id, None)
                     reply_text(reply_token, "這張圖片不像發票或收據，因此沒有啟動代墊登記。")
@@ -2068,7 +2159,7 @@ async def webhook(request: Request):
                     start_loading(user_id)
                     session["step"] = "receipt_processing"
                     session["pending_text"] = ""
-                    data, missing = process_receipt_image(user_id, receipt_base64, receipt_mime)
+                    data, missing = await asyncio.to_thread(process_receipt_image, user_id, receipt_base64, receipt_mime)
                 except ValueError as error:
                     session["step"] = "receipt_waiting_image"
                     reply_text(reply_token, str(error))
@@ -2113,7 +2204,7 @@ async def webhook(request: Request):
                 try:
                     start_loading(user_id)
                     EXPENSE_SESSIONS[user_id] = {"step": "receipt_processing", "updated_at": time.time(), "pending_text": "", "data": {"registrantUserId": user_id}}
-                    data, missing = process_receipt_image(user_id, receipt_base64, receipt_mime)
+                    data, missing = await asyncio.to_thread(process_receipt_image, user_id, receipt_base64, receipt_mime)
                 except ValueError:
                     EXPENSE_SESSIONS.pop(user_id, None)
                     reply_text(reply_token, "這張圖片目前無法確認為代墊單據，請重新拍攝清楚完整的收據或發票。")
@@ -2142,7 +2233,7 @@ async def webhook(request: Request):
                 session["step"] = "receipt_processing"
                 try:
                     start_loading(user_id)
-                    receipt_data, _ = process_receipt_image(user_id, receipt_base64, receipt_mime)
+                    receipt_data, _ = await asyncio.to_thread(process_receipt_image, user_id, receipt_base64, receipt_mime)
                 except (ValueError, requests.RequestException):
                     session["step"] = previous_step
                     reply_text(reply_token, "目前無法辨識單據，原本資料已保留，請重新拍攝後再上傳。")
@@ -2270,10 +2361,9 @@ async def webhook(request: Request):
                 reply_text(reply_token, "你的帳號尚未加入公司內部登記名單。")
                 continue
             try:
-                data, _ = process_receipt_image(
-                    user_id,
-                    pending_receipt["receiptBase64"],
-                    pending_receipt["receiptMimeType"],
+                data, _ = await asyncio.to_thread(
+                    process_receipt_image, user_id,
+                    pending_receipt["receiptBase64"], pending_receipt["receiptMimeType"],
                 )
                 data = merge_expense_text(data, text, user_id)
             except ValueError as error:
@@ -2304,10 +2394,9 @@ async def webhook(request: Request):
             session = get_expense_session(user_id)
             if session and session.get("step") == "receipt_waiting_trigger":
                 try:
-                    data, missing = process_receipt_image(
-                        user_id,
-                        session["receiptBase64"],
-                        session["receiptMimeType"],
+                    data, missing = await asyncio.to_thread(
+                        process_receipt_image, user_id,
+                        session["receiptBase64"], session["receiptMimeType"],
                     )
                 except ValueError as error:
                     EXPENSE_SESSIONS.pop(user_id, None)
@@ -2356,10 +2445,13 @@ async def webhook(request: Request):
                 "raw_text": combined_text,
                 "data": data,
             }
+            if not missing:
+                activate_text_receipt_link(user_id, session)
             EXPENSE_SESSIONS[user_id] = session
             if missing:
                 reply_messages(reply_token, [build_project_or_missing_prompt(session, missing)])
             else:
+                await asyncio.to_thread(save_expense_draft, user_id, session)
                 reply_messages(reply_token, [build_expense_confirmation(data)])
             continue
 
