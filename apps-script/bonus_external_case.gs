@@ -11,6 +11,9 @@ function handleBonusPost_(payload) {
       if (payload.action === 'submit') return bonusJson_(bonusSubmit_(spreadsheet, payload.data || {}));
       if (payload.action === 'approve') return bonusJson_(bonusResolve_(spreadsheet, payload, true));
       if (payload.action === 'discuss' || payload.action === 'reject') return bonusJson_(bonusDiscuss_(spreadsheet, payload));
+      if (payload.action === 'attendance_config_get') return bonusJson_(attendanceConfigGet_());
+      if (payload.action === 'attendance_config_set') return bonusJson_(attendanceConfigSet_(payload.config || {}));
+      if (payload.action === 'attendance_record') return bonusJson_(attendanceRecord_(spreadsheet, payload.attendance || {}));
     } finally {
       lock.releaseLock();
     }
@@ -19,6 +22,49 @@ function handleBonusPost_(payload) {
     console.error(error);
     return bonusJson_({ok: false, error: 'Internal error'});
   }
+}
+
+const ATTENDANCE_SHEET_NAME_ = '打卡紀錄';
+
+function attendanceConfigGet_() {
+  const raw = PropertiesService.getScriptProperties().getProperty('attendance_config');
+  if (!raw) return {ok:true,config:{configured:false}};
+  const config = JSON.parse(raw);
+  config.configured = true;
+  return {ok:true,config:config};
+}
+
+function attendanceConfigSet_(config) {
+  const latitude = Number(config.latitude), longitude = Number(config.longitude);
+  const radiusMeters = Math.round(Number(config.radiusMeters || 200));
+  if (!isFinite(latitude) || !isFinite(longitude) || radiusMeters < 10 || radiusMeters > 5000) return {ok:false,error:'Invalid attendance config'};
+  const stored = {latitude:latitude,longitude:longitude,address:String(config.address || '').slice(0,300),radiusMeters:radiusMeters,updatedBy:String(config.updatedBy || '').slice(0,80),updatedAt:new Date().toISOString()};
+  PropertiesService.getScriptProperties().setProperty('attendance_config', JSON.stringify(stored));
+  stored.configured = true;
+  return {ok:true,config:stored};
+}
+
+function attendanceSheet_(spreadsheet) {
+  const headers = ['寫入時間','打卡時間','姓名','LINE User ID','類型','結果','距離（公尺）','允許半徑（公尺）','打卡地址','緯度','經度','中心地址','中心緯度','中心經度','交易識別碼','GPS 精準度（公尺）','來源'];
+  let sheet = spreadsheet.getSheetByName(ATTENDANCE_SHEET_NAME_);
+  if (!sheet) sheet = spreadsheet.insertSheet(ATTENDANCE_SHEET_NAME_);
+  if (sheet.getMaxColumns() < headers.length) sheet.insertColumnsAfter(sheet.getMaxColumns(), headers.length - sheet.getMaxColumns());
+  const current = sheet.getLastRow() === 0 ? [] : sheet.getRange(1,1,1,headers.length).getValues()[0];
+  sheet.getRange(1,1,1,headers.length).setValues([headers.map(function(header,index){return current[index] || header;})]);
+  sheet.setFrozenRows(1);
+  return sheet;
+}
+
+function attendanceRecord_(spreadsheet, attendance) {
+  const transactionId = String(attendance.transactionId || '').trim();
+  if (!transactionId || !attendance.userId || !attendance.recordedAt) return {ok:false,error:'Missing attendance fields'};
+  const sheet = attendanceSheet_(spreadsheet);
+  if (sheet.getLastRow() >= 2) {
+    const found = sheet.getRange(2,15,sheet.getLastRow()-1,1).createTextFinder(transactionId).matchEntireCell(true).findNext();
+    if (found) return {ok:true,duplicate:true,row:found.getRow()};
+  }
+  sheet.appendRow([new Date(),String(attendance.recordedAt),String(attendance.employeeName || ''),String(attendance.userId),String(attendance.type || ''),attendance.withinRange === true ? '成功' : '範圍外',Number(attendance.distanceMeters || 0),Number(attendance.radiusMeters || 0),String(attendance.address || ''),Number(attendance.latitude),Number(attendance.longitude),String(attendance.centerAddress || ''),Number(attendance.centerLatitude),Number(attendance.centerLongitude),transactionId,Number(attendance.accuracyMeters || 0),String(attendance.source || 'LINE位置訊息')]);
+  return {ok:true,duplicate:false,row:sheet.getLastRow()};
 }
 
 function bonusLog_(spreadsheet) {
