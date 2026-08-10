@@ -21,7 +21,7 @@ import requests
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-APP_RELEASE = "2026-08-10-external-v4-any-amount"
+APP_RELEASE = "2026-08-10-external-v5-achuan-date"
 import external_case
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
