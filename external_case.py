@@ -57,9 +57,19 @@ def parse_amount(text: str) -> int | None:
             units = digits.get(token, 0)
         return units * 10_000 if units > 0 else None
     match = re.search(r"(?:金額\s*[：:]?\s*|NT\$|\$)\s*([\d,]+)|([\d,]+)\s*(?:元|塊)", normalized, re.I)
-    if not match:
+    if match:
+        raw = next((part for part in match.groups() if part), "")
+        value = int(raw.replace(",", ""))
+        return value if value > 0 else None
+    # 員工常直接輸入「外案 100000」；移除日期後，接受外案後方至少四位的純數字金額。
+    if "外案" not in normalized:
         return None
-    raw = next((part for part in match.groups() if part), "")
+    tail = normalized.split("外案", 1)[1]
+    tail = re.sub(r"(?:(?:20\d{2})\s*年\s*)?\d{1,2}\s*(?:月|[/.-])\s*\d{1,2}\s*(?:日|號)?", " ", tail)
+    bare = re.search(r"(?<![\d/.-])([\d,]{4,})(?![\d/.-])", tail)
+    if not bare:
+        return None
+    raw = bare.group(1)
     value = int(raw.replace(",", ""))
     return value if value > 0 else None
 
@@ -120,7 +130,7 @@ def prompt(step: str) -> dict[str, Any]:
     texts = {
         "projectName": "這個案子叫什麼？",
         "date": "哪一天？例如：8/10",
-        "amount": "金額是多少？預設會當作稅外；如果你報的是含稅總額，請一起寫「含稅」。",
+        "amount": "金額是多少？例如：10萬或100000",
     }
     if step in texts:
         return {"type": "text", "text": texts[step]}

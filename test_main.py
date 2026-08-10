@@ -195,6 +195,18 @@ def test_external_case_five_field_reply_always_advances_to_confirmation():
     assert session["data"]["contact"] == "王小姐"
 
 
+def test_external_case_accepts_bare_numeric_amount_after_keyword():
+    data = external_case.parse_initial("8月10號外案 100000", "U-staff", "阿筌")
+    assert data["date"] == "2026-08-10"
+    assert data["amount"] == 100000
+    assert data["taxMode"] == "稅外"
+
+
+def test_external_case_missing_amount_prompt_has_no_old_tax_copy():
+    message = external_case.prompt("amount")
+    assert message["text"] == "金額是多少？例如：10萬或100000"
+
+
 def test_external_case_full_webhook_returns_visible_flex_confirmation(monkeypatch):
     user_id = main.EXTERNAL_CASE_OWNER_USER_ID
     replies = []
