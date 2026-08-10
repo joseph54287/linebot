@@ -21,7 +21,7 @@ import requests
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-APP_RELEASE = "2026-08-10-external-v5-achuan-date"
+APP_RELEASE = "2026-08-10-external-v6-confirm-modify"
 import external_case
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
@@ -1827,6 +1827,13 @@ async def webhook(request: Request):
                         reply_text(reply_token, "這筆外案已逾時，請重新輸入「外案」。")
                     else:
                         reply_messages(reply_token, [external_next_message(session)])
+                    continue
+                if action == "modify":
+                    session = external_case.begin_modify(user_id)
+                    if not session:
+                        reply_text(reply_token, "這筆外案已逾時，請重新輸入「外案」。")
+                    else:
+                        reply_messages(reply_token, [external_case.modification_prompt(session["data"])])
                     continue
                 if action == "submit":
                     session = external_case.get_session(user_id)
