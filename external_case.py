@@ -119,7 +119,12 @@ def infer_case_type(text: str) -> str:
 
 def parse_payment_date(text: str, now: datetime | None = None) -> str:
     match = re.search(r"(?:預計)?匯款(?:日期|日)?\s*[：:]?\s*([^\n，,]+)", text)
-    return parse_date(match.group(1), now) if match else ""
+    if not match:
+        return ""
+    value = unicodedata.normalize("NFKC", match.group(1)).strip()
+    if any(keyword in value for keyword in ["尚未確認", "未確認", "不知道", "不確定", "未定", "還沒確定", "還不知道"]):
+        return "尚未確認"
+    return parse_date(value, now)
 
 
 def parse_initial(text: str, user_id: str, employee_name: str) -> dict[str, Any]:

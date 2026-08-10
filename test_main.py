@@ -215,6 +215,37 @@ def test_external_case_modify_returns_to_details_and_preserves_values():
     assert "聯繫窗口：王小姐" in prompt
 
 
+@pytest.mark.parametrize("value", ["尚未確認", "不知道", "不確定", "未定", "還沒確定", "還不知道"])
+def test_external_case_payment_date_unknown_words_are_canonical(value):
+    assert external_case.parse_payment_date(f"預計匯款日：{value}") == "尚未確認"
+
+
+def test_external_case_unknown_payment_date_can_reach_confirmation():
+    user_id = "U9478b00702c716685d9d8b021d62d538"
+    external_case.start("8月10號5萬塊的外案", user_id, "阿筌")
+    session = external_case.accept_text(
+        user_id,
+        "案名：品牌片\n案型：導演案\n款項進入：公司\n預計匯款日：不知道\n聯繫窗口：王小姐",
+    )
+    assert session["step"] == "confirm"
+    assert session["data"]["paymentDate"] == "尚未確認"
+
+
+def test_external_case_tax_inclusive_amount_is_converted_to_pretax_for_bonus():
+    data = external_case.parse_initial("8月10號10萬含稅的外案", "U-staff", "周暐")
+    assert data["enteredAmount"] == 100000
+    assert data["taxMode"] == "含稅"
+    assert data["amount"] == 95238
+    assert external_case.tax_amounts(data) == (95238, 4762, 100000)
+    card = external_case.confirmation_card({
+        **data, "projectName": "品牌片", "caseType": "導演案", "destination": "公司",
+        "paymentDate": "尚未確認", "contact": "王小姐",
+    })
+    body_text = "\n".join(item["text"] for item in card["contents"]["body"]["contents"])
+    assert "未稅金額：$95,238" in body_text
+    assert "你的獎金 40%：$38,095" in body_text
+
+
 def test_external_case_accepts_bare_numeric_amount_after_keyword():
     data = external_case.parse_initial("8月10號外案 100000", "U-staff", "阿筌")
     assert data["date"] == "2026-08-10"
