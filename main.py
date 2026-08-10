@@ -6,22 +6,25 @@ import base64
 import asyncio
 import hashlib
 import hmac
+import json
 import logging
+import math
 import os
 import re
 import time
 import uuid
 from contextvars import ContextVar
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs
 from zoneinfo import ZoneInfo
 
 import requests
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
-APP_RELEASE = "2026-08-10-external-v7-payment-tax"
+APP_RELEASE = "2026-08-10-attendance-v1-external-v7"
 import external_case
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
@@ -43,6 +46,8 @@ QUOTE_OWNER_USER_ID = "Ub983deb79584603885e5b28e9fdf2d5d"
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN", "")
+LIFF_ID = os.environ.get("LIFF_ID", "")
+LIFF_CHANNEL_ID = os.environ.get("LIFF_CHANNEL_ID", "")
 CALENDAR_IDS = tuple(
     calendar_id.strip()
     for calendar_id in os.environ.get(
@@ -85,6 +90,19 @@ BATCH_TTL_SECONDS = 15 * 60
 RECENT_EXPENSE_PROJECTS: dict[str, dict[str, Any]] = {}
 RECENT_PROJECT_TTL_SECONDS = 24 * 60 * 60
 
+# 打卡流程只短暫記住「上班／下班」與設定位置的意圖；實際紀錄與中心點均寫入雲端。
+ATTENDANCE_SESSIONS: dict[str, dict[str, Any]] = {}
+ATTENDANCE_SESSION_TTL_SECONDS = 5 * 60
+ATTENDANCE_DEFAULT_RADIUS_METERS = 200
+ATTENDANCE_ADMIN_USER_IDS = {
+    user_id.strip()
+    for user_id in os.environ.get(
+        "ATTENDANCE_ADMIN_USER_IDS",
+        f"{OWNER_USER_ID},{QUOTE_OWNER_USER_ID}",
+    ).split(",")
+    if user_id.strip()
+}
+
 EXPENSE_CATEGORIES = [
     "案件支出（餐飲、道具、人員...）",
     "例行性支出(水電費/房租)",
@@ -123,7 +141,7 @@ CLOSED_PROJECT_STATUSES = {
 INTERNAL_USER_NAMES = {
     "U6c6441cb38102499d1f80d4ea79a53ab": "周暐",
     "Ub983deb79584603885e5b28e9fdf2d5d": "高爾賢",
-    "U9478b00702c716685d9d8b021d62d538": "阿全",
+    "U9478b00702c716685d9d8b021d62d538": "阿筌",
 }
 # 獎金表使用的正式姓名必須與 COUNTIF 關鍵字完全一致。
 EXTERNAL_CASE_NAMES = {
@@ -325,6 +343,184 @@ def reply_messages(reply_token: str, messages: list[dict[str, Any]]) -> None:
 def reply_text(reply_token: str, text: str) -> None:
     """回覆單一文字訊息。"""
     reply_messages(reply_token, [{"type": "text", "text": text}])
+
+
+def attendance_menu() -> dict[str, Any]:
+    """建立打卡入口。"""
+    if LIFF_ID:
+        base_url = f"https://liff.line.me/{LIFF_ID}"
+        return {
+            "type": "flex",
+            "altText": "上下班打卡",
+            "contents": {
+                "type": "bubble",
+                "header": {"type": "box", "layout": "vertical", "backgroundColor": "#111827", "paddingAll": "20px", "contents": [
+                    {"type": "text", "text": "阿爾特影視打卡", "color": "#FFFFFF", "weight": "bold", "size": "xl"},
+                    {"type": "text", "text": "選擇後自動記錄時間與位置", "color": "#D1D5DB", "size": "sm", "margin": "sm"},
+                ]},
+                "body": {"type": "box", "layout": "vertical", "spacing": "md", "paddingAll": "20px", "contents": [
+                    {"type": "button", "style": "primary", "height": "sm", "color": "#2563EB", "action": {"type": "uri", "label": "上班打卡", "uri": f"{base_url}?type=clock_in"}},
+                    {"type": "button", "style": "secondary", "height": "sm", "action": {"type": "uri", "label": "下班打卡", "uri": f"{base_url}?type=clock_out"}},
+                ]},
+            },
+        }
+    return {
+        "type": "text",
+        "text": "請選擇這次要登記的類型。下一步會請你分享目前位置。",
+        "quickReply": {"items": [
+            {"type": "action", "action": {"type": "message", "label": "上班打卡", "text": "上班打卡"}},
+            {"type": "action", "action": {"type": "message", "label": "下班打卡", "text": "下班打卡"}},
+        ]},
+    }
+
+
+def attendance_location_prompt(label: str) -> dict[str, Any]:
+    """要求使用者透過 LINE 原生位置訊息分享座標。"""
+    return {
+        "type": "text",
+        "text": f"準備登記「{label}」。請按下方按鈕分享你現在的位置；5 分鐘內有效。",
+        "quickReply": {"items": [
+            {"type": "action", "action": {"type": "location", "label": "分享目前位置"}},
+        ]},
+    }
+
+
+def attendance_api(action: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """呼叫既有受 API Key 保護的 Apps Script 後端。"""
+    if not BONUS_API_URL or not BONUS_API_KEY:
+        raise requests.RequestException("attendance backend is not configured")
+    response = requests.post(
+        BONUS_API_URL,
+        params={"key": BONUS_API_KEY},
+        json={"action": action, **(payload or {})},
+        timeout=20,
+    )
+    response.raise_for_status()
+    result = response.json()
+    if not result.get("ok"):
+        raise requests.RequestException(str(result.get("error") or "attendance backend rejected request"))
+    return result
+
+
+def verify_liff_id_token(id_token: str) -> dict[str, Any]:
+    """向 LINE Login 驗證 LIFF ID token，取得可信任的 User ID。"""
+    if not LIFF_CHANNEL_ID or not id_token:
+        raise requests.RequestException("LIFF verification is not configured")
+    response = requests.post(
+        "https://api.line.me/oauth2/v2.1/verify",
+        data={"id_token": id_token, "client_id": LIFF_CHANNEL_ID},
+        timeout=10,
+    )
+    response.raise_for_status()
+    profile = response.json()
+    if not profile.get("sub"):
+        raise requests.RequestException("LINE ID token has no subject")
+    return profile
+
+
+def record_liff_attendance(user_id: str, attendance_type: str, latitude: float, longitude: float, accuracy: float) -> dict[str, Any]:
+    """使用伺服器時間驗證範圍並寫入 LIFF 打卡。"""
+    labels = {"clock_in": "上班打卡", "clock_out": "下班打卡"}
+    if attendance_type not in labels or user_id not in INTERNAL_USER_IDS:
+        raise PermissionError("attendance is not allowed")
+    config = attendance_api("attendance_config_get").get("config") or {}
+    if not config.get("configured"):
+        raise KeyError("attendance center is not configured")
+    center_latitude = float(config["latitude"])
+    center_longitude = float(config["longitude"])
+    radius = int(config.get("radiusMeters") or ATTENDANCE_DEFAULT_RADIUS_METERS)
+    distance = attendance_distance_meters(latitude, longitude, center_latitude, center_longitude)
+    within_range = distance <= radius
+    recorded_at = datetime.now(TAIPEI_TZ).isoformat(timespec="seconds")
+    transaction_id = uuid.uuid4().hex
+    attendance_api("attendance_record", {"attendance": {
+        "transactionId": transaction_id, "type": labels[attendance_type], "recordedAt": recorded_at,
+        "userId": user_id, "employeeName": INTERNAL_USER_NAMES.get(user_id, ""),
+        "latitude": latitude, "longitude": longitude, "address": "LIFF GPS",
+        "centerLatitude": center_latitude, "centerLongitude": center_longitude,
+        "centerAddress": str(config.get("address") or ""), "radiusMeters": radius,
+        "distanceMeters": round(distance, 1), "accuracyMeters": round(max(0.0, accuracy), 1),
+        "withinRange": within_range, "source": "LIFF",
+    }})
+    return {
+        "ok": True, "success": within_range, "type": labels[attendance_type],
+        "recordedAt": recorded_at, "distanceMeters": round(distance), "radiusMeters": radius,
+    }
+
+
+def attendance_distance_meters(latitude: float, longitude: float, center_latitude: float, center_longitude: float) -> float:
+    """以 Haversine 公式計算兩個 WGS84 座標的直線距離。"""
+    earth_radius = 6_371_000.0
+    lat1, lat2 = math.radians(latitude), math.radians(center_latitude)
+    delta_lat = math.radians(center_latitude - latitude)
+    delta_lng = math.radians(center_longitude - longitude)
+    value = math.sin(delta_lat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(delta_lng / 2) ** 2
+    return earth_radius * 2 * math.atan2(math.sqrt(value), math.sqrt(1 - value))
+
+
+def get_attendance_session(user_id: str) -> dict[str, Any] | None:
+    session = ATTENDANCE_SESSIONS.get(user_id)
+    if not session:
+        return None
+    if time.time() - float(session.get("updated_at") or 0) > ATTENDANCE_SESSION_TTL_SECONDS:
+        ATTENDANCE_SESSIONS.pop(user_id, None)
+        return None
+    return session
+
+
+def process_attendance_location(user_id: str, message: dict[str, Any], event_id: str) -> str:
+    """處理打卡或管理員設定中心點的位置訊息。"""
+    session = get_attendance_session(user_id)
+    if not session:
+        return "這個位置沒有對應到進行中的打卡。請先輸入「打卡」。"
+    latitude = float(message["latitude"])
+    longitude = float(message["longitude"])
+    address = str(message.get("address") or message.get("title") or "")
+    if session["mode"] == "configure":
+        attendance_api("attendance_config_set", {"config": {
+            "latitude": latitude, "longitude": longitude, "address": address,
+            "radiusMeters": ATTENDANCE_DEFAULT_RADIUS_METERS, "updatedBy": user_id,
+        }})
+        ATTENDANCE_SESSIONS.pop(user_id, None)
+        center = address or f"{latitude:.6f}, {longitude:.6f}"
+        return f"打卡地點已設定完成。\n中心：{center}\n有效範圍：{ATTENDANCE_DEFAULT_RADIUS_METERS} 公尺內"
+
+    config = attendance_api("attendance_config_get").get("config") or {}
+    if not config.get("configured"):
+        ATTENDANCE_SESSIONS.pop(user_id, None)
+        return "尚未設定公司打卡中心點。請管理員先輸入「設定打卡地點」。"
+    center_latitude = float(config["latitude"])
+    center_longitude = float(config["longitude"])
+    radius = int(config.get("radiusMeters") or ATTENDANCE_DEFAULT_RADIUS_METERS)
+    distance = attendance_distance_meters(latitude, longitude, center_latitude, center_longitude)
+    within_range = distance <= radius
+    recorded_at = datetime.now(TAIPEI_TZ).isoformat(timespec="seconds")
+    attendance_api("attendance_record", {"attendance": {
+        "transactionId": event_id or uuid.uuid4().hex, "type": session["type"], "recordedAt": recorded_at,
+        "userId": user_id, "employeeName": INTERNAL_USER_NAMES.get(user_id, ""),
+        "latitude": latitude, "longitude": longitude, "address": address,
+        "centerLatitude": center_latitude, "centerLongitude": center_longitude,
+        "centerAddress": str(config.get("address") or ""), "radiusMeters": radius,
+        "distanceMeters": round(distance, 1), "withinRange": within_range,
+    }})
+    ATTENDANCE_SESSIONS.pop(user_id, None)
+    clock = datetime.fromisoformat(recorded_at).strftime("%Y/%m/%d %H:%M:%S")
+    if within_range:
+        return f"{session['type']}成功\n時間：{clock}\n地點：{address or '已取得座標'}\n距離中心點：約 {distance:.0f} 公尺"
+    return f"未完成{session['type']}：目前不在允許範圍內。\n時間：{clock}\n距離中心點：約 {distance:.0f} 公尺（需在 {radius} 公尺內）\n本次嘗試已留下紀錄。"
+
+
+def update_attendance_radius(user_id: str, radius: int) -> dict[str, Any]:
+    """保留既有中心點，只調整允許半徑。"""
+    if radius < 10 or radius > 5000:
+        raise ValueError("radius out of range")
+    config = attendance_api("attendance_config_get").get("config") or {}
+    if not config.get("configured"):
+        raise KeyError("attendance center is not configured")
+    return attendance_api("attendance_config_set", {"config": {
+        "latitude": config["latitude"], "longitude": config["longitude"],
+        "address": config.get("address", ""), "radiusMeters": radius, "updatedBy": user_id,
+    }})
 
 
 def google_access_token() -> str:
@@ -2131,6 +2327,16 @@ async def webhook(request: Request):
         message = event.get("message", {})
         message_type = message.get("type")
 
+        if message_type == "location" and source.get("type") == "user":
+            if user_id not in INTERNAL_USER_IDS:
+                continue
+            try:
+                result = await asyncio.to_thread(process_attendance_location, user_id, message, event_id)
+                reply_text(reply_token, result)
+            except (KeyError, TypeError, ValueError, requests.RequestException):
+                reply_text(reply_token, "打卡資料目前無法安全寫入，請稍後重新輸入「打卡」再試一次。")
+            continue
+
         if message_type == "image" and source.get("type") == "user":
             if user_id not in INTERNAL_USER_IDS:
                 continue
@@ -2305,6 +2511,37 @@ async def webhook(request: Request):
 
         text = message.get("text", "").strip()
         command = text.casefold()
+
+        if source.get("type") == "user" and user_id in INTERNAL_USER_IDS:
+            if command == "打卡":
+                reply_messages(reply_token, [attendance_menu()])
+                continue
+            if command in {"上班打卡", "下班打卡"}:
+                label = "上班打卡" if command == "上班打卡" else "下班打卡"
+                ATTENDANCE_SESSIONS[user_id] = {"mode": "attendance", "type": label, "updated_at": time.time()}
+                reply_messages(reply_token, [attendance_location_prompt(label)])
+                continue
+            if command == "設定打卡地點":
+                if user_id not in ATTENDANCE_ADMIN_USER_IDS:
+                    reply_text(reply_token, "只有打卡管理員可以變更中心點。")
+                    continue
+                ATTENDANCE_SESSIONS[user_id] = {"mode": "configure", "updated_at": time.time()}
+                reply_messages(reply_token, [attendance_location_prompt("設定打卡地點")])
+                continue
+            radius_match = re.fullmatch(r"設定打卡範圍\s*(\d{2,4})", text)
+            if radius_match:
+                if user_id not in ATTENDANCE_ADMIN_USER_IDS:
+                    reply_text(reply_token, "只有打卡管理員可以變更範圍。")
+                    continue
+                radius = int(radius_match.group(1))
+                try:
+                    await asyncio.to_thread(update_attendance_radius, user_id, radius)
+                    reply_text(reply_token, f"打卡有效範圍已更新為 {radius} 公尺內。")
+                except ValueError:
+                    reply_text(reply_token, "打卡範圍請設定為 10～5000 公尺。")
+                except (KeyError, requests.RequestException):
+                    reply_text(reply_token, "目前尚未設定中心點，請先輸入「設定打卡地點」。")
+                continue
 
         # 三位內部成員可用今日、明日、後天、本週或「行程」查詢指定範圍。
         if is_calendar_command(event):
@@ -2593,6 +2830,8 @@ async def health():
             GROUP_REGISTRY_URL and GROUP_REGISTRY_API_KEY
         ),
         "expense_configured": bool(EXPENSE_API_URL and EXPENSE_API_KEY),
+        "attendance_configured": bool(BONUS_API_URL and BONUS_API_KEY),
+        "liff_configured": bool(LIFF_ID and LIFF_CHANNEL_ID),
         "receipt_vision_configured": bool(GEMINI_API_KEY),
         "quote_webhook_configured": bool(QUOTE_WEBHOOK_URL),
         "calendar_configured": bool(
@@ -2607,3 +2846,35 @@ async def health():
 async def root():
     """提供部署狀態說明，不顯示任何敏感憑證。"""
     return {"service": "AURTOR LINE Bot", "status": "running"}
+
+
+@app.get("/attendance", response_class=HTMLResponse)
+async def attendance_page():
+    """提供 LINE LIFF 內的一鍵打卡頁。"""
+    template = (Path(__file__).parent / "templates" / "attendance.html").read_text(encoding="utf-8")
+    return HTMLResponse(template.replace("__LIFF_ID__", json.dumps(LIFF_ID)[1:-1]))
+
+
+@app.post("/api/attendance/record")
+async def liff_attendance_record(request: Request):
+    """驗證 LINE 身分後，以伺服器時間完成上下班打卡。"""
+    try:
+        body = await request.json()
+        profile = await asyncio.to_thread(verify_liff_id_token, str(body.get("idToken") or ""))
+        result = await asyncio.to_thread(
+            record_liff_attendance,
+            str(profile["sub"]),
+            str(body.get("type") or ""),
+            float(body["latitude"]),
+            float(body["longitude"]),
+            float(body.get("accuracy") or 0),
+        )
+        return result
+    except PermissionError:
+        return JSONResponse({"ok": False, "error": "forbidden", "message": "此 LINE 帳號沒有打卡權限。"}, status_code=403)
+    except KeyError:
+        return JSONResponse({"ok": False, "error": "not_configured", "message": "尚未設定公司打卡地點。"}, status_code=409)
+    except (TypeError, ValueError):
+        return JSONResponse({"ok": False, "error": "invalid_location", "message": "無法取得有效位置，請重新打卡。"}, status_code=400)
+    except requests.RequestException:
+        return JSONResponse({"ok": False, "error": "service_unavailable", "message": "目前無法安全完成打卡，請稍後再試。"}, status_code=503)

@@ -42,3 +42,9 @@ services:
         value: U6c6441cb38102499d1f80d4ea79a53ab
       - key: INTERNAL_USER_IDS
         value: U6c6441cb38102499d1f80d4ea79a53ab,Ub983deb79584603885e5b28e9fdf2d5d,U9478b00702c716685d9d8b021d62d538
+      - key: ATTENDANCE_ADMIN_USER_IDS
+        value: U6c6441cb38102499d1f80d4ea79a53ab,Ub983deb79584603885e5b28e9fdf2d5d
+      - key: LIFF_ID
+        sync: false
+      - key: LIFF_CHANNEL_ID
+        sync: false

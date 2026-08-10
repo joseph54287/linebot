@@ -9,6 +9,78 @@ import main
 import external_case
 
 
+def test_attendance_distance_and_location_prompt():
+    assert main.attendance_distance_meters(25.0, 121.5, 25.0, 121.5) == 0
+    assert 90 < main.attendance_distance_meters(25.0, 121.5, 25.0009, 121.5) < 110
+    prompt = main.attendance_location_prompt("上班打卡")
+    assert prompt["quickReply"]["items"][0]["action"]["type"] == "location"
+
+
+def test_attendance_location_records_success(monkeypatch):
+    user_id = main.QUOTE_OWNER_USER_ID
+    calls = []
+    main.ATTENDANCE_SESSIONS[user_id] = {"mode": "attendance", "type": "上班打卡", "updated_at": main.time.time()}
+
+    def fake_api(action, payload=None):
+        calls.append((action, payload))
+        if action == "attendance_config_get":
+            return {"ok": True, "config": {"configured": True, "latitude": 25.0, "longitude": 121.5, "radiusMeters": 200, "address": "公司"}}
+        return {"ok": True, "row": 2}
+
+    monkeypatch.setattr(main, "attendance_api", fake_api)
+    result = main.process_attendance_location(user_id, {"latitude": 25.0005, "longitude": 121.5, "address": "新店"}, "evt-1")
+    assert "上班打卡成功" in result
+    assert [item[0] for item in calls] == ["attendance_config_get", "attendance_record"]
+    assert calls[1][1]["attendance"]["withinRange"] is True
+    assert calls[1][1]["attendance"]["transactionId"] == "evt-1"
+
+
+def test_attendance_location_records_out_of_range(monkeypatch):
+    user_id = main.QUOTE_OWNER_USER_ID
+    recorded = {}
+    main.ATTENDANCE_SESSIONS[user_id] = {"mode": "attendance", "type": "下班打卡", "updated_at": main.time.time()}
+
+    def fake_api(action, payload=None):
+        if action == "attendance_config_get":
+            return {"ok": True, "config": {"configured": True, "latitude": 25.0, "longitude": 121.5, "radiusMeters": 200}}
+        recorded.update(payload["attendance"])
+        return {"ok": True}
+
+    monkeypatch.setattr(main, "attendance_api", fake_api)
+    result = main.process_attendance_location(user_id, {"latitude": 25.01, "longitude": 121.5}, "evt-2")
+    assert "不在允許範圍" in result
+    assert recorded["withinRange"] is False
+
+
+def test_liff_attendance_uses_verified_user_and_server_time(monkeypatch):
+    calls = []
+
+    def fake_api(action, payload=None):
+        calls.append((action, payload))
+        if action == "attendance_config_get":
+            return {"ok": True, "config": {"configured": True, "latitude": 25.0, "longitude": 121.5, "radiusMeters": 200, "address": "公司"}}
+        return {"ok": True, "row": 2}
+
+    monkeypatch.setattr(main, "attendance_api", fake_api)
+    result = main.record_liff_attendance(main.QUOTE_OWNER_USER_ID, "clock_in", 25.0005, 121.5, 12.3)
+    assert result["success"] is True
+    record = calls[1][1]["attendance"]
+    assert record["userId"] == main.QUOTE_OWNER_USER_ID
+    assert record["type"] == "上班打卡"
+    assert record["accuracyMeters"] == 12.3
+    assert record["source"] == "LIFF"
+    assert record["recordedAt"].endswith("+08:00")
+
+
+def test_liff_attendance_rejects_unknown_user():
+    try:
+        main.record_liff_attendance("U-unknown", "clock_in", 25.0, 121.5, 10)
+    except PermissionError:
+        pass
+    else:
+        raise AssertionError("unknown LINE user must be rejected")
+
+
 def test_calendar_command_merges_two_days_into_blue_cards(monkeypatch):
     calls = []
     today_event = {
@@ -648,7 +720,7 @@ def test_parse_lists_all_missing_fields_at_once():
         "代墊買東西",
         "U9478b00702c716685d9d8b021d62d538",
     )
-    assert data["payer"] == "阿全"
+    assert data["payer"] == "阿筌"
     assert "金額" in missing
     assert "專案名稱" in missing
     assert "項目分類或更清楚的消費內容" not in missing

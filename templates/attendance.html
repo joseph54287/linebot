@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#111827">
+  <title>阿爾特影視打卡</title>
+  <script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
+  <style>
+    :root { color-scheme: light; font-family: -apple-system, BlinkMacSystemFont, "Noto Sans TC", sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; background: #f3f4f6; color: #111827; display: grid; place-items: center; padding: 24px; }
+    main { width: min(100%, 420px); background: #fff; border-radius: 24px; padding: 32px 24px; box-shadow: 0 20px 55px rgba(17,24,39,.12); text-align: center; }
+    .mark { width: 56px; height: 56px; margin: 0 auto 20px; border-radius: 18px; background: #111827; color: #fff; display: grid; place-items: center; font-weight: 800; }
+    h1 { font-size: 24px; margin: 0 0 10px; }
+    p { margin: 0; color: #6b7280; line-height: 1.6; }
+    .spinner { width: 40px; height: 40px; margin: 28px auto; border: 4px solid #dbeafe; border-top-color: #2563eb; border-radius: 50%; animation: spin .8s linear infinite; }
+    .result { display: none; margin-top: 24px; padding: 18px; border-radius: 16px; font-weight: 700; line-height: 1.7; white-space: pre-line; }
+    .success { display: block; color: #166534; background: #dcfce7; }
+    .failure { display: block; color: #991b1b; background: #fee2e2; }
+    button { display: none; width: 100%; margin-top: 16px; border: 0; border-radius: 14px; padding: 14px; background: #111827; color: #fff; font-size: 16px; font-weight: 700; }
+    small { display: block; margin-top: 20px; color: #9ca3af; line-height: 1.5; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="mark">A</div>
+    <h1 id="title">正在確認打卡</h1>
+    <p id="status">正在取得目前位置，請稍候…</p>
+    <div class="spinner" id="spinner" aria-label="處理中"></div>
+    <div class="result" id="result"></div>
+    <button id="retry" type="button">重新嘗試</button>
+    <small>打卡會記錄 LINE 身分、伺服器時間、GPS 位置與距離；僅供公司出勤管理使用。</small>
+  </main>
+  <script>
+    const LIFF_ID = "__LIFF_ID__";
+    const type = new URLSearchParams(location.search).get("type");
+    const labels = { clock_in: "上班打卡", clock_out: "下班打卡" };
+    const statusEl = document.getElementById("status");
+    const titleEl = document.getElementById("title");
+    const resultEl = document.getElementById("result");
+    const spinnerEl = document.getElementById("spinner");
+    const retryEl = document.getElementById("retry");
+
+    function show(message, success) {
+      spinnerEl.style.display = "none";
+      statusEl.style.display = "none";
+      resultEl.textContent = message;
+      resultEl.className = `result ${success ? "success" : "failure"}`;
+      titleEl.textContent = success ? "打卡完成" : "打卡未完成";
+      if (!success) retryEl.style.display = "block";
+    }
+
+    function locate() {
+      statusEl.textContent = "正在取得目前位置，請稍候…";
+      navigator.geolocation.getCurrentPosition(submit, () => {
+        show("無法取得目前位置。請在手機設定中允許 LINE 使用定位，再重新嘗試。", false);
+      }, { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 });
+    }
+
+    async function submit(position) {
+      statusEl.textContent = "正在核對打卡範圍…";
+      try {
+        const response = await fetch("/api/attendance/record", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            idToken: liff.getIDToken(), type,
+            latitude: position.coords.latitude,
+            longitude: position.coords.longitude,
+            accuracy: position.coords.accuracy
+          })
+        });
+        const data = await response.json();
+        if (!response.ok || !data.ok) throw new Error(data.message || "目前無法完成打卡。");
+        const time = new Date(data.recordedAt).toLocaleString("zh-TW", { timeZone: "Asia/Taipei", hour12: false });
+        if (data.success) show(`${data.type}成功\n${time}\n距離中心點約 ${data.distanceMeters} 公尺`, true);
+        else show(`目前距離中心點約 ${data.distanceMeters} 公尺\n需在 ${data.radiusMeters} 公尺內，未完成打卡。`, false);
+      } catch (error) {
+        show(error.message || "目前無法完成打卡，請稍後再試。", false);
+      }
+    }
+
+    retryEl.addEventListener("click", () => location.reload());
+    (async () => {
+      try {
+        if (!LIFF_ID || !labels[type]) throw new Error("打卡連結尚未完成設定。");
+        titleEl.textContent = labels[type];
+        await liff.init({ liffId: LIFF_ID });
+        if (!liff.isLoggedIn()) { liff.login({ redirectUri: location.href }); return; }
+        locate();
+      } catch (error) {
+        show(error.message || "LINE 打卡初始化失敗。", false);
+      }
+    })();
+  </script>
+</body>
+</html>
