@@ -1,6 +1,5 @@
-/** 外案待核准紀錄與「獎金試算／專案」歸檔端點。 */
+/** 外案待核准與核准結果紀錄端點；測試資料只保留在外案申請紀錄。 */
 const BONUS_LOG_SHEET = '外案申請紀錄';
-const BONUS_PROJECT_SHEET = '專案';
 
 function handleBonusPost_(payload) {
   try {
@@ -64,14 +63,9 @@ function bonusResolve_(spreadsheet, payload, approved) {
   const result = {ok:true,employeeName:values[2],employeeUserId:values[3],projectName:values[5]};
   if (status === '已核准') return Object.assign(result,{duplicate:true,status:status});
   if (values[8] === '尚未確認') return {ok:false,error:'Destination unresolved'};
-  const projectRow = bonusInsertProject_(spreadsheet, {
-    requestId:values[0], employeeName:values[2], date:values[4], projectName:values[5],
-    amount:Number(values[6]), caseType:values[7], destination:values[8], approverUserId:payload.approverUserId || '',
-    paymentDate:values[13], taxMode:values[14], taxAmount:Number(values[15]), grossAmount:Number(values[16]), contact:values[17],
-  });
   sheet.getRange(row,2).setValue('已核准');
-  sheet.getRange(row,11,1,3).setValues([[payload.approverUserId || '',new Date(),projectRow]]);
-  return Object.assign(result,{status:'已核准',projectRow:projectRow});
+  sheet.getRange(row,11,1,3).setValues([[payload.approverUserId || '',new Date(),'']]);
+  return Object.assign(result,{status:'已核准'});
 }
 
 function bonusDiscuss_(spreadsheet, payload) {
@@ -86,39 +80,6 @@ function bonusDiscuss_(spreadsheet, payload) {
   sheet.getRange(row,2).setValue('待討論');
   sheet.getRange(row,11,1,2).setValues([[payload.approverUserId || '',new Date()]]);
   return Object.assign(result,{status:'待討論'});
-}
-
-function bonusInsertProject_(spreadsheet, data) {
-  const sheet = spreadsheet.getSheetByName(BONUS_PROJECT_SHEET);
-  if (!sheet) throw new Error('Project sheet not found');
-  const headers = ['案型','外案申請編號','外案狀態','LINE申請人','核准人','申請核准時間','來源','預計匯款日期','計價方式','稅額','含稅收款','聯繫窗口'];
-  if (!sheet.getRange(1,13).getValue()) sheet.getRange(1,13,1,headers.length).setValues([headers]);
-  const existing = sheet.getRange('N:N').createTextFinder(String(data.requestId)).matchEntireCell(true).findNext();
-  if (existing) return existing.getRow();
-  const month = new Date(data.date).getMonth() + 1;
-  const lastRow = Math.max(sheet.getLastRow(), 2);
-  const monthValues = sheet.getRange(1,1,lastRow,1).getValues().flat();
-  let start = 2, end = lastRow + 1;
-  for (let index=1; index<monthValues.length; index++) {
-    if (Number(monthValues[index]) === month) {
-      start = index + 2;
-      for (let next=index+1; next<monthValues.length; next++) {
-        if (monthValues[next] !== '' && monthValues[next] !== null) { end = next + 1; break; }
-      }
-      break;
-    }
-  }
-  let target = start;
-  while (target < end && sheet.getRange(target,2,1,11).getDisplayValues()[0].some(String)) target++;
-  if (target >= end) sheet.insertRowBefore(end);
-  sheet.getRange(target,2,1,3).setValues([[new Date(data.date),data.projectName,data.amount]]);
-  sheet.getRange(target,9).setValue(data.employeeName);
-  sheet.getRange(target,11).setValue(data.destination);
-  sheet.getRange(target,13,1,7).setValues([[data.caseType,data.requestId,'已核准',data.employeeName,data.approverUserId,new Date(),'LINE Bot']]);
-  sheet.getRange(target,20).setValue(data.paymentDate);
-  sheet.getRange(target,21,1,3).setValues([[data.taxMode,data.taxAmount,data.grossAmount]]);
-  sheet.getRange(target,24).setValue(data.contact);
-  return target;
 }
 
 function bonusJson_(value) {
