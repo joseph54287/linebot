@@ -234,6 +234,22 @@ def test_external_case_amount_received_reply_matches_confirmed_copy():
     )
 
 
+@pytest.mark.parametrize("text", [
+    "8月10號5萬塊的外案",
+    "8 月 10 號 5 萬塊的外案",
+    "８月１０號５萬塊的外案",
+    "8\u200b月\u200b10\u200b號 5萬塊的外案",
+    "八月十號五萬塊的外案",
+])
+def test_achuan_external_case_date_and_amount_variants_go_to_details(text):
+    user_id = "U9478b00702c716685d9d8b021d62d538"
+    session = external_case.start(text, user_id, "阿筌")
+    assert session["data"]["date"] == "2026-08-10"
+    assert session["data"]["amount"] == 50000
+    assert session["step"] == "details"
+    assert external_case.prompt(session["step"])["text"].startswith("金額收到，請再補這五項")
+
+
 def test_external_case_full_webhook_returns_visible_flex_confirmation(monkeypatch):
     user_id = main.EXTERNAL_CASE_OWNER_USER_ID
     replies = []
