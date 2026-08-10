@@ -1803,8 +1803,17 @@ async def webhook(request: Request):
         CURRENT_WEBHOOK_EVENT_ID.set(event_id)
 
         # 外案申請獨立於代墊流程：主管核准成功後才寫入獎金表。
-        if event.get("type") == "postback" and source.get("type") == "user":
+        # 主管卡片改用 message action，避免部分 LINE 用戶端未送出 Flex postback。
+        raw_external = ""
+        if event.get("type") == "postback":
             raw_external = event.get("postback", {}).get("data", "")
+        elif event.get("type") == "message" and event.get("message", {}).get("type") == "text":
+            external_text = str(event.get("message", {}).get("text") or "").strip()
+            if external_text.startswith("外案核准:"):
+                raw_external = "external:approve:" + external_text.removeprefix("外案核准:")
+            elif external_text.startswith("外案待討論:"):
+                raw_external = "external:discuss:" + external_text.removeprefix("外案待討論:")
+        if raw_external and source.get("type") == "user":
             if raw_external.startswith("external:"):
                 parts = raw_external.split(":", 3)
                 action = parts[1] if len(parts) > 1 else ""

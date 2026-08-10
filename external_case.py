@@ -226,8 +226,8 @@ def approval_card(data: dict[str, Any]) -> dict[str, Any]:
         ]},
         "body": {"type": "box", "layout": "vertical", "paddingAll": "20px", "contents": body},
         "footer": {"type": "box", "layout": "vertical", "spacing": "sm", "paddingAll": "20px", "contents": [
-            {"type": "button", "style": "primary", "color": "#193B65", "action": {"type": "postback", "label": "確認成立", "data": f"external:approve:{request_id}", "displayText": "確認成立"}},
-            {"type": "button", "style": "secondary", "action": {"type": "postback", "label": "待討論", "data": f"external:discuss:{request_id}", "displayText": "待討論"}},
+            {"type": "button", "style": "primary", "color": "#193B65", "action": {"type": "message", "label": "確認成立", "text": f"外案核准:{request_id}"}},
+            {"type": "button", "style": "secondary", "action": {"type": "message", "label": "待討論", "text": f"外案待討論:{request_id}"}},
         ]},
     }}
 

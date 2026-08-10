@@ -144,8 +144,8 @@ def test_external_case_owner_card_has_confirm_and_discuss_only():
     card = external_case.approval_card(data)
     assert card["type"] == "flex"
     actions = [button["action"] for button in card["contents"]["footer"]["contents"]]
-    assert [(action["label"], action["data"].split(":")[1]) for action in actions] == [
-        ("確認成立", "approve"), ("待討論", "discuss"),
+    assert [(action["label"], action["text"].split(":")[0]) for action in actions] == [
+        ("確認成立", "外案核准"), ("待討論", "外案待討論"),
     ]
 
 
@@ -289,6 +289,45 @@ def test_owner_self_submission_replies_with_pending_status_and_approval_card(mon
     assert asyncio.run(main.webhook(request)) == {"status": "ok"}
     assert replies[-1][0]["text"].startswith("已送出，現在是「待核准」")
     assert [button["action"]["label"] for button in replies[-1][1]["contents"]["footer"]["contents"]] == ["確認成立", "待討論"]
+
+
+def test_external_approval_card_uses_message_actions():
+    data = external_case.parse_initial("8月10號外案8萬", "U-staff", "周暐")
+    data.update({"projectName": "羽球", "caseType": "導演案", "destination": "公司", "paymentDate": "2026-09-15", "contact": "王小姐"})
+    actions = [button["action"] for button in external_case.approval_card(data)["contents"]["footer"]["contents"]]
+    assert actions == [
+        {"type": "message", "label": "確認成立", "text": f"外案核准:{data['requestId']}"},
+        {"type": "message", "label": "待討論", "text": f"外案待討論:{data['requestId']}"},
+    ]
+
+
+def test_owner_can_approve_external_case_via_message_action(monkeypatch):
+    replies = []
+    monkeypatch.setattr(main, "verify_signature", lambda raw, signature: True)
+    monkeypatch.setattr(external_case, "api_call", lambda *args, **kwargs: {
+        "ok": True, "employeeUserId": "U-staff", "projectName": "羽球",
+    })
+    monkeypatch.setattr(main, "reply_text", lambda token, text: replies.append(text))
+    monkeypatch.setattr(main, "push_messages", lambda *args, **kwargs: None)
+    request_id = "85edf6ec-a604-4ffe-8f40-73e8ee357db8"
+    payload = {"events": [{
+        "type": "message", "replyToken": "reply-approve",
+        "source": {"type": "user", "userId": main.EXTERNAL_CASE_OWNER_USER_ID},
+        "message": {"type": "text", "text": f"外案核准:{request_id}"},
+    }]}
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    delivered = False
+
+    async def receive():
+        nonlocal delivered
+        if delivered:
+            return {"type": "http.disconnect"}
+        delivered = True
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    request = Request({"type": "http", "method": "POST", "path": "/webhook", "headers": [(b"x-line-signature", b"test")]}, receive)
+    assert asyncio.run(main.webhook(request)) == {"status": "ok"}
+    assert replies == ["已核准，並完成登記。"]
 
 
 def all_actions(value):
