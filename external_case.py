@@ -18,6 +18,14 @@ SESSIONS: dict[str, dict[str, Any]] = {}
 
 CASE_TYPES = ["導演案", "剪接案", "製片案", "其他"]
 DESTINATIONS = ["公司", "員工個人", "尚未確認"]
+DETAILS_PROMPT = (
+    "金額收到，請再補這五項\n\n"
+    "案名：\n"
+    "案型：導演案／剪接案／製片案／其他\n"
+    "款項進入：公司／員工個人／尚未確認\n"
+    "預計匯款日：\n"
+    "聯繫窗口："
+)
 
 
 def is_external_case_text(text: str) -> bool:
@@ -44,6 +52,14 @@ def parse_amount(text: str) -> int | None:
     if match:
         value = float(match.group(1).replace(",", "")) * 10_000
         return int(value) if value > 0 and value.is_integer() else None
+    match = re.search(r"(?:NT\$|\$)?\s*([\d,]+(?:\.\d+)?)\s*(?:千|[kK])", normalized)
+    if match:
+        value = float(match.group(1).replace(",", "")) * 1_000
+        return int(value) if value > 0 and value.is_integer() else None
+    colloquial_ten_thousand = re.search(r"([一二兩三四五六七八九])\s*萬\s*([一二三四五六七八九])", normalized)
+    if colloquial_ten_thousand:
+        digits = {"一": 1, "二": 2, "兩": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+        return digits[colloquial_ten_thousand.group(1)] * 10_000 + digits[colloquial_ten_thousand.group(2)] * 1_000
     chinese_ten_thousand = re.search(r"(?:^|\D)(十|[一二兩三四五六七八九]\s*十?|十\s*[一二三四五六七八九])\s*萬", normalized)
     if chinese_ten_thousand:
         token = re.sub(r"\s+", "", chinese_ten_thousand.group(1))
@@ -61,15 +77,15 @@ def parse_amount(text: str) -> int | None:
         raw = next((part for part in match.groups() if part), "")
         value = int(raw.replace(",", ""))
         return value if value > 0 else None
-    # 員工常直接輸入「外案 100000」；移除日期後，接受外案後方至少四位的純數字金額。
+    # 員工也會直接輸入「外案 500」或「外案 100000」；移除日期後取最後一個純數字。
     if "外案" not in normalized:
         return None
     tail = normalized.split("外案", 1)[1]
     tail = re.sub(r"(?:(?:20\d{2})\s*年\s*)?\d{1,2}\s*(?:月|[/.-])\s*\d{1,2}\s*(?:日|號)?", " ", tail)
-    bare = re.search(r"(?<![\d/.-])([\d,]{4,})(?![\d/.-])", tail)
-    if not bare:
+    bare_values = re.findall(r"(?<![\d/.-])([\d,]+)(?![\d/.-])", tail)
+    if not bare_values:
         return None
-    raw = bare.group(1)
+    raw = bare_values[-1]
     value = int(raw.replace(",", ""))
     return value if value > 0 else None
 
@@ -130,19 +146,12 @@ def prompt(step: str) -> dict[str, Any]:
     texts = {
         "projectName": "這個案子叫什麼？",
         "date": "哪一天？例如：8/10",
-        "amount": "金額是多少？例如：10萬或100000",
+        "amount": "金額是多少？",
     }
     if step in texts:
         return {"type": "text", "text": texts[step]}
     if step == "details":
-        return {"type": "text", "text": (
-            "金額收到，請再補這五項\n\n"
-            "案名：\n"
-            "案型：導演案／剪接案／製片案／其他\n"
-            "款項進入：公司／員工個人／尚未確認\n"
-            "預計匯款日：\n"
-            "聯繫窗口："
-        )}
+        return {"type": "text", "text": DETAILS_PROMPT}
     options = CASE_TYPES if step == "caseType" else DESTINATIONS
     title = "這是什麼類型的案子？" if step == "caseType" else "客戶的款項會匯到哪裡？"
     return {
