@@ -234,11 +234,33 @@ def confirmation_card(data: dict[str, Any]) -> dict[str, Any]:
             {"type": "text", "text": "確認後才會送進公司營運系統", "color": "#DCE7F5", "size": "xs", "margin": "sm"},
         ]},
         "body": {"type": "box", "layout": "vertical", "paddingAll": "20px", "contents": body},
-        "footer": {"type": "box", "layout": "vertical", "paddingAll": "20px", "contents": [{
-            "type": "button", "style": "primary", "color": "#193B65",
-            "action": {"type": "postback", "label": "確認送出", "data": "external:submit", "displayText": "確認送出"},
-        }]},
+        "footer": {"type": "box", "layout": "vertical", "spacing": "sm", "paddingAll": "20px", "contents": [
+            {"type": "button", "style": "primary", "color": "#193B65",
+             "action": {"type": "postback", "label": "確認送出", "data": "external:submit", "displayText": "確認送出"}},
+            {"type": "button", "style": "secondary",
+             "action": {"type": "postback", "label": "修改", "data": "external:modify", "displayText": "修改外案資料"}},
+        ]},
     }}
+
+
+def modification_prompt(data: dict[str, Any]) -> dict[str, Any]:
+    return {"type": "text", "text": (
+        "請修改後重新傳送這五項\n\n"
+        f"案名：{data.get('projectName', '')}\n"
+        f"案型：{data.get('caseType', '')}\n"
+        f"款項進入：{data.get('destination', '')}\n"
+        f"預計匯款日：{data.get('paymentDate', '')}\n"
+        f"聯繫窗口：{data.get('contact', '')}"
+    )}
+
+
+def begin_modify(user_id: str) -> dict[str, Any] | None:
+    session = get_session(user_id)
+    if not session or session.get("step") != "confirm":
+        return None
+    session["step"] = "details"
+    session["updatedAt"] = time.time()
+    return session
 
 
 def approval_card(data: dict[str, Any]) -> dict[str, Any]:
