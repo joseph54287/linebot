@@ -185,6 +185,8 @@ def test_external_case_uses_two_step_prompt_and_one_final_confirmation():
     assert card["type"] == "flex"
     action = card["contents"]["footer"]["contents"][0]["action"]
     assert action == {"type": "postback", "label": "確認送出", "data": "external:submit", "displayText": "確認送出"}
+    modify = card["contents"]["footer"]["contents"][1]["action"]
+    assert modify == {"type": "postback", "label": "修改", "data": "external:modify", "displayText": "修改外案資料"}
 
 
 def test_external_case_five_field_reply_always_advances_to_confirmation():
@@ -195,6 +197,22 @@ def test_external_case_five_field_reply_always_advances_to_confirmation():
     )
     assert session["step"] == "confirm"
     assert session["data"]["contact"] == "王小姐"
+
+
+def test_external_case_modify_returns_to_details_and_preserves_values():
+    user_id = "U9478b00702c716685d9d8b021d62d538"
+    session = external_case.start("8月10號5萬塊的外案", user_id, "阿筌")
+    session["data"].update({
+        "projectName": "品牌片", "caseType": "導演案", "destination": "公司",
+        "paymentDate": "2026-09-15", "contact": "王小姐",
+    })
+    session["step"] = "confirm"
+    modified = external_case.begin_modify(user_id)
+    assert modified["step"] == "details"
+    assert modified["data"]["amount"] == 50000
+    prompt = external_case.modification_prompt(modified["data"])["text"]
+    assert "案名：品牌片" in prompt
+    assert "聯繫窗口：王小姐" in prompt
 
 
 def test_external_case_accepts_bare_numeric_amount_after_keyword():
