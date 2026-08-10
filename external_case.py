@@ -34,10 +34,27 @@ def is_external_case_text(text: str) -> bool:
 
 def parse_date(text: str, now: datetime | None = None) -> str:
     today = (now or datetime.now(TAIPEI)).date()
-    match = re.search(r"(?:(20\d{2})\s*年\s*)?(\d{1,2})\s*(?:月|[/.-])\s*(\d{1,2})\s*(?:日|號)?", text)
-    if not match:
-        return ""
-    year, month, day = match.groups()
+    normalized = unicodedata.normalize("NFKC", text)
+    normalized = re.sub(r"[\u200b-\u200d\ufeff]", "", normalized)
+    match = re.search(r"(?:(20\d{2})\s*年\s*)?(\d{1,2})\s*(?:月|[/.-])\s*(\d{1,2})\s*(?:日|號)?", normalized)
+    if match:
+        year, month, day = match.groups()
+    else:
+        chinese = re.search(r"([一二三四五六七八九十]{1,3})\s*月\s*([一二三四五六七八九十]{1,3})\s*(?:日|號)?", normalized)
+        if not chinese:
+            return ""
+
+        def chinese_number(token: str) -> int:
+            digits = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+            if token == "十":
+                return 10
+            if "十" in token:
+                left, right = token.split("十", 1)
+                return digits.get(left, 1) * 10 + digits.get(right, 0)
+            return digits.get(token, 0)
+
+        year = None
+        month, day = map(chinese_number, chinese.groups())
     try:
         return datetime(int(year or today.year), int(month), int(day)).date().isoformat()
     except ValueError:
