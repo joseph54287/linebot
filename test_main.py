@@ -3,6 +3,8 @@
 import asyncio
 import json
 
+import pytest
+
 import main
 import external_case
 
@@ -204,7 +206,32 @@ def test_external_case_accepts_bare_numeric_amount_after_keyword():
 
 def test_external_case_missing_amount_prompt_has_no_old_tax_copy():
     message = external_case.prompt("amount")
-    assert message["text"] == "金額是多少？例如：10萬或100000"
+    assert message["text"] == "金額是多少？"
+
+
+@pytest.mark.parametrize(("text", "expected"), [
+    ("8月10號外案 500", 500),
+    ("8月10號外案 8,500", 8500),
+    ("8月10號外案 3千", 3000),
+    ("8月10號外案 2.5k", 2500),
+    ("8月10號外案 1.5萬", 15000),
+    ("8月10號外案 一萬五", 15000),
+    ("8月10號外案 十萬", 100000),
+    ("8月10號外案 100000元", 100000),
+])
+def test_external_case_recognizes_common_amount_formats(text, expected):
+    assert external_case.parse_amount(text) == expected
+
+
+def test_external_case_amount_received_reply_matches_confirmed_copy():
+    assert external_case.prompt("details")["text"] == (
+        "金額收到，請再補這五項\n\n"
+        "案名：\n"
+        "案型：導演案／剪接案／製片案／其他\n"
+        "款項進入：公司／員工個人／尚未確認\n"
+        "預計匯款日：\n"
+        "聯繫窗口："
+    )
 
 
 def test_external_case_full_webhook_returns_visible_flex_confirmation(monkeypatch):
