@@ -68,7 +68,7 @@ function attendanceRecord_(spreadsheet, attendance) {
 }
 
 function bonusLog_(spreadsheet) {
-  const headers = ['申請編號','狀態','員工','LINE User ID','日期','案名','未稅金額','案型','款項匯入','申請時間','核准人','處理時間','專案列','預計匯款日期','計價方式','稅額','含稅收款','聯繫窗口'];
+  const headers = ['狀態','申請人','案件日期','案名','案型','款項進入','未稅金額','計價方式','稅額','含稅收款','預計匯款日','聯繫窗口','申請時間','核准人','處理時間','申請編號（系統）','申請人 LINE ID（系統）','核准人 LINE ID（系統）'];
   let sheet = spreadsheet.getSheetByName(BONUS_LOG_SHEET);
   if (!sheet) {
     sheet = spreadsheet.insertSheet(BONUS_LOG_SHEET);
@@ -76,6 +76,15 @@ function bonusLog_(spreadsheet) {
   }
   sheet.getRange(1,1,1,headers.length).setValues([headers]);
   return sheet;
+}
+
+function bonusApproverName_(userId) {
+  const names = {
+    'Ub983deb79584603885e5b28e9fdf2d5d': '高爾賢',
+    'U6c6441cb38102499d1f80d4ea79a53ab': '周暐',
+    'U9478b00702c716685d9d8b021d62d538': '阿筌',
+  };
+  return names[String(userId || '')] || '';
 }
 
 function bonusSubmit_(spreadsheet, data) {
@@ -89,43 +98,45 @@ function bonusSubmit_(spreadsheet, data) {
   const grossAmount = taxMode === '含稅' ? Number(data.enteredAmount) : Math.round(amount * 1.05);
   const taxAmount = grossAmount - amount;
   const paymentDateValue = data.paymentDate === '尚未確認' ? '尚未確認' : new Date(data.paymentDate);
-  const found = sheet.getRange('A:A').createTextFinder(String(data.requestId)).matchEntireCell(true).findNext();
+  const found = sheet.getRange('P:P').createTextFinder(String(data.requestId)).matchEntireCell(true).findNext();
   if (found) {
     const row = found.getRow();
-    sheet.getRange(row,5,1,5).setValues([[new Date(data.date),data.projectName,amount,data.caseType,data.destination]]);
-    sheet.getRange(row,14,1,5).setValues([[paymentDateValue,taxMode,taxAmount,grossAmount,data.contact]]);
+    sheet.getRange(row,2,1,11).setValues([[data.employeeName,new Date(data.date),data.projectName,data.caseType,data.destination,amount,taxMode,taxAmount,grossAmount,paymentDateValue,data.contact]]);
+    sheet.getRange(row,17).setValue(data.employeeUserId);
     return {ok:true,duplicate:true,requestId:data.requestId};
   }
-  sheet.appendRow([data.requestId,'待核准',data.employeeName,data.employeeUserId,new Date(data.date),data.projectName,amount,data.caseType,data.destination,new Date(),'','','',paymentDateValue,taxMode,taxAmount,grossAmount,data.contact]);
+  sheet.appendRow(['待核准',data.employeeName,new Date(data.date),data.projectName,data.caseType,data.destination,amount,taxMode,taxAmount,grossAmount,paymentDateValue,data.contact,new Date(),'','',data.requestId,data.employeeUserId,'']);
   return {ok:true,requestId:data.requestId};
 }
 
 function bonusResolve_(spreadsheet, payload, approved) {
   const sheet = bonusLog_(spreadsheet);
-  const found = sheet.getRange('A:A').createTextFinder(String(payload.requestId || '')).matchEntireCell(true).findNext();
+  const found = sheet.getRange('P:P').createTextFinder(String(payload.requestId || '')).matchEntireCell(true).findNext();
   if (!found) return {ok:false,error:'Not found'};
   const row = found.getRow();
   const values = sheet.getRange(row,1,1,18).getValues()[0];
-  const status = values[1];
-  const result = {ok:true,employeeName:values[2],employeeUserId:values[3],projectName:values[5]};
+  const status = values[0];
+  const result = {ok:true,employeeName:values[1],employeeUserId:values[16],projectName:values[3]};
   if (status === '已核准') return Object.assign(result,{duplicate:true,status:status});
-  if (values[8] === '尚未確認') return {ok:false,error:'Destination unresolved'};
-  sheet.getRange(row,2).setValue('已核准');
-  sheet.getRange(row,11,1,3).setValues([[payload.approverUserId || '',new Date(),'']]);
+  if (values[5] === '尚未確認') return {ok:false,error:'Destination unresolved'};
+  sheet.getRange(row,1).setValue('已核准');
+  sheet.getRange(row,14,1,2).setValues([[bonusApproverName_(payload.approverUserId),new Date()]]);
+  sheet.getRange(row,18).setValue(payload.approverUserId || '');
   return Object.assign(result,{status:'已核准'});
 }
 
 function bonusDiscuss_(spreadsheet, payload) {
   const sheet = bonusLog_(spreadsheet);
-  const found = sheet.getRange('A:A').createTextFinder(String(payload.requestId || '')).matchEntireCell(true).findNext();
+  const found = sheet.getRange('P:P').createTextFinder(String(payload.requestId || '')).matchEntireCell(true).findNext();
   if (!found) return {ok:false,error:'Not found'};
   const row = found.getRow();
   const values = sheet.getRange(row,1,1,18).getValues()[0];
-  const result = {ok:true,employeeName:values[2],employeeUserId:values[3],projectName:values[5]};
-  if (values[1] === '已核准') return {ok:false,error:'Already approved'};
-  if (values[1] === '待討論') return Object.assign(result,{duplicate:true,status:'待討論'});
-  sheet.getRange(row,2).setValue('待討論');
-  sheet.getRange(row,11,1,2).setValues([[payload.approverUserId || '',new Date()]]);
+  const result = {ok:true,employeeName:values[1],employeeUserId:values[16],projectName:values[3]};
+  if (values[0] === '已核准') return {ok:false,error:'Already approved'};
+  if (values[0] === '待討論') return Object.assign(result,{duplicate:true,status:'待討論'});
+  sheet.getRange(row,1).setValue('待討論');
+  sheet.getRange(row,14,1,2).setValues([[bonusApproverName_(payload.approverUserId),new Date()]]);
+  sheet.getRange(row,18).setValue(payload.approverUserId || '');
   return Object.assign(result,{status:'待討論'});
 }
 
